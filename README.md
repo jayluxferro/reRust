@@ -19,7 +19,8 @@ reRust makes those apps transparent again:
   plumbing); debug-signed APK output that runs on **unrooted** devices, ad-hoc re-signed
   ipa output for the iOS pipeline (simulator-validated; see the iOS section of
   [docs/lab-setup.md](docs/lab-setup.md)).
-- `rerust frida <apk|lib> --proxy URL` — the same interception at runtime, no repack.
+- `rerust frida <apk|lib> --proxy URL` — the same interception at runtime, no repack
+  (Android-validated; the generated agent is platform-neutral JS but untested on iOS).
 
 ```bash
 # pip / uv
