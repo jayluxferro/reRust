@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync
+      - run: uv run pytest -q
+
+      - name: Version to publish
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if already on PyPI
+        id: check
+        run: |
+          if curl -fsS https://pypi.org/pypi/rerust/json | grep -q "\"${{ steps.ver.outputs.version }}\""; then
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            echo "rerust ${{ steps.ver.outputs.version }} already on PyPI — skipping upload"
+          else
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        if: steps.check.outputs.published == 'true'
+        run: uv build
+
+      - name: Publish to PyPI
+        if: steps.check.outputs.published == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+
+      - name: GitHub release
+        run: |
+          gh release create "${GITHUB_REF_NAME}" --title "reRust ${GITHUB_REF_NAME}" \
+            --notes "See [PyPI](https://pypi.org/project/rerust/${{ steps.ver.outputs.version }}/) and the changelog in the repo." \
+            --verify-tag || echo "release already exists"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
