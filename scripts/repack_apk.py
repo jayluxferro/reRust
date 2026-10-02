@@ -39,6 +39,7 @@ sys.path.insert(0, str(REPO / "src"))
 from rerust.repack import repack_apk  # noqa: E402  (path set above)
 
 import os
+import pathlib
 
 def _find_sdk():
     for v in (os.environ.get("ANDROID_SDK_ROOT"), os.environ.get("ANDROID_HOME"),
