@@ -19,6 +19,14 @@ entry unlocks every app on that release.
 
 ## Method (the chain that survived contact with real apps)
 
+**Shortcut:** a disassembler with dataflow tracing (e.g. IDA via `idalib`) reproduces
+steps 2-4 in one pass — trace backward from a panic-`Location` struct and you get the
+struct typed with line/column, its single ADRP/ADD xref, and the containing function
+byte-exact. Prefer that when available; the manual chain below is the dependency-free
+fallback and the cross-check. Caveat: inferred function bounds may include trailing
+unwind pads past the epilogue `ret` — record both the tool's bounds and the
+ret-terminated range when deriving.
+
 1. **Fingerprint** the target with `rerust inspect` — crate versions, provider,
    arch. No pattern without a fingerprint match.
 2. **Locate verifier candidates** from the crate set's structure. For rustls-based
