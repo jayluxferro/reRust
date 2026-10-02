@@ -1,0 +1,418 @@
+# rustls 0.23.40 / aarch64 / aws-lc-rs — trust-defeat patch (librhttp stack)
+#
+# Derivation walkthrough: docs/research/rustls-trust-defeat-walkthrough.md
+# (the yaml records WHAT to patch; the walkthrough records WHY it is what it is).
+# Derived 2026-10-02 from the target app 4.4.6's librhttp.so.
+#
+# VERSION DEVIATION FROM THE BRIEF (recorded prominently on purpose): this
+# binary is rustls 0.23.40, NOT 0.23.38 — the classifier reads crate versions
+# off the embedded registry path strings (.cargo/registry/...)
+# \rustls-0.23.40\..., aws-lc-rs 1.17.0, reqwest 0.13.4, rustls-platform-
+# verifier 0.7.0). select_pattern gates the DB on the FINGERPRINTED version,
+# so a 0.23.38 entry can never select for this lib even though the mission
+# brief said "4.4.6 = 0.23.38". The DB filename must match reality or the
+# pipeline silently applies nothing.
+#
+# METHOD CAVEAT for this build (differs from 0.23.38 libfjs): the
+# panic-Location static route from the walkthrough does NOT exist here —
+# there is NO "server_verifier.rs" path string anywhere in the binary. Why:
+# the only panicking op in 0.23.40's server_verifier.rs is the
+# RevocationOptionsBuilder::new(...).unwrap() at line 253, and this build's
+# optimizer proved the unwrap infallible (crl_refs is provably non-empty in
+# the else-branch), folding the Location static away. The 0.23.38 libfjs
+# build kept it. Do not treat "Location string absent" as "verifier absent" —
+# the folded NoVerifier bodies and the dispatcher cmps below locate the
+# machinery instead.
+#
+# ACTIVE-PATCH VERDICT (2026-10-02, TWO bench-falsification rounds recorded):
+# librhttp ships FOUR ServerCertVerifier impls (census below). The live one —
+# the one whose verify_server_cert rejects the proxy certificate — is the
+# FOURTH: a custom webpki-compatible verifier (72-byte struct, its own packed
+# trust records, NOT rustls' WebPkiServerVerifier, NOT the platform verifier,
+# NOT reqwest's NoVerifier). Trail of evidence, kept because it is the
+# transferable part: bench 1 patched A (webpki) -> TLS still failed with
+# `tlsv1 alert unknown ca`; bench 2 patched C (platform) -> identical
+# failure; rustls 0.23.40 maps CertificateError::UnknownIssuer ->
+# AlertDescription::UnknownCA (error.rs:642), so the alert is a genuine
+# unpatched trust rejection, meaning the live vs_cert was neither A nor C.
+# Bench 3 then confirmed the assignment: with D's vs_cert patched, the same
+# hosts that alerted now pass through mitmdump with 200 OK (runtime_findings).
+# The fourth impl surfaced only when its verify_tls12/13_signature WRAPPERS
+# (tail-branches to the shared helpers 0x3db9c8/0x3da42c) were xref'd — its
+# vtable unit was missed twice: once by the adjacency heuristic (it lives at
+# 0x5b1660, far from the A/B/C cluster at 0x5b49c0+), once by a census that
+# required all 8 fn-slot addends to be .text (this one's +0x50 slot points
+# into .rodata). LESSON: census by CALLER xrefs of shared helpers, not by
+# vtable-shape alone, and never scope the search to the "obvious" region.
+
+target:
+  crate: rustls
+  version: 0.23.40
+  arch: aarch64
+  extras:            # everything that pins codegen for this pattern
+    rustls-webpki: 0.103.13
+    rustls-pki-types: 1.14.1
+    crypto: aws-lc      # aws-lc-rs 1.17.0; NOTE: the classifier token is
+                        # "aws-lc" (tls_stack emits "rustls+aws-lc"),
+                        # and select_pattern does a substring test —
+                        # "aws-lc-rs" here would NEVER match (found live)
+    reqwest: 0.13.4
+    hyper: 1.10.1
+
+derived_from:
+  binary_sha256: "bdfc3acd233ba400c99fe4f2a830d7e3840fb49725a355a34abac407f963db35"
+  binary: "librhttp.so (the target app 4.4.6 arm64-v8a), 6,061,168 B, stripped, LTO"
+  method: >
+    Four-verifier census, bench-driven. Step 1: NoVerifier's ICF-folded
+    accept-all bodies (mov w9,#0xff ; strb w9,[x8] ; ret at 0x360f40/0x360f4c)
+    anchor cluster B. Step 2: the adjacent cluster 0x5b49c0 is rustls'
+    WebPkiServerVerifier (A), the next 0x5b4a10 the platform verifier (C).
+    Step 3 (after benches 1-2 falsified A and C as the live verifier): every
+    function tail-branching to the shared signature helpers 0x3db9c8 /
+    0x3da42c was collected — three wrapper PAIRS fell out (A's, C's, and an
+    unaccounted one at 0x3fe900/0x3fe918). Relocs referencing that pair
+    (0x5b1688/0x5b1690) exposed the fourth vtable at 0x5b1660 with the SAME
+    default-method slots (requires_raw_public_keys=0x3b1f20,
+    root_hint_subjects=0x20ce60) as A and C — structural proof of a fourth
+    ServerCertVerifier impl. Step 4: its verify_server_cert (slot +0x20 =
+    0x3fe558) decodes as a webpki-compatible chain verification over the
+    impl's OWN trust records — this yaml's patch site.
+
+validation_corpus:
+  live_verifier_pattern:    { matches: 1, at: 0x3FE558, note: "exact-one, whole-file scan (shipped matcher)" }
+  webpki_pattern_parked:    { matches: 1, at: 0x360868, note: "unique too; bench-1-proven not the live rejector" }
+  platform_pattern_parked:  { matches: 1, at: 0x407C88, note: "unique too; bench-2-proven not the live rejector" }
+  libfjs_4.4.6:             { matches: 0, rustls: 0.23.38, crypto: ring, note: "separate DB entry (rustls-0.23.38_aarch64_ring.yaml)" }
+  librhttp_4.3.7:           { matches: 0, rustls: 0.23.37, crypto: ring, note: "0.23.37 entry covers that binary; windows do not cross-match either direction" }
+  conclusion: >
+    Same rule as the other entries: (version, crypto-provider, build)-specific.
+    Note this is the first DB entry where the same .so name maps to a
+    DIFFERENT rustls minor than the previous app release — app updates can
+    silently move the stack; always re-classify before reaching for a DB hit.
+
+# ---------------------------------------------------------------------------
+# OK-TAG CONVENTION (per-binary; 0xFF in this target — do NOT carry 0x16 over
+# from the 0.23.37 entry, and do not carry this 0xFF anywhere else either).
+#
+# Confirmed FROM THIS BINARY, per impl and shared:
+#   1. dispatcher A (verify_server_cert, sret at sp+0x18 in ExpectCertificate
+#      handling): `ldrb w8,[sp,#0x18] ; cmp w8,#0xff` at 0x3f2f7c.
+#   2. dispatcher B (verify_tls13_signature, sret at sp+0xa0): cmp #0xff at
+#      0x3f3110.
+#   3. webpki producer (A): after `bl verify_server_name` (0x3fe2d0),
+#      `ldrb w8,[sp,#0xd8] ; cmp w8,#0xff ; b.eq +4` (0x360a4c..0x360a54),
+#      success `strb w8,[x19]` at 0x360a9c (x19 = sret captured at entry).
+#   4. platform producer (C): its OWN tag tests at BOTH inner call sites —
+#      0x407cac and 0x407da0, Ok landing `strb w8,[x19]` at 0x407da8.
+#   5. fourth producer (LIVE): its OWN tag tests after BOTH verification
+#      stages — 0x3fe858 (chain check via 0x3fe2d0) and 0x3fe8dc (second
+#      stage via 0x3da75c), success landing `mov w8,#0xff ; strb w8,[x19]`
+#      at 0x3fe8e4. An impl that returned a different-tagged Result would
+#      fail its own dispatch — the per-binary tag is self-consistent across
+#      ALL ServerCertVerifier impls by construction.
+#   Independent confirmation: reqwest/NoVerifier's ICF-folded accept-all
+#   bodies at 0x360f40 and 0x360f4c are `mov w9,#0xff ; strb w9,[x8] ; ret`
+#   — they WRITE 0xFF (0.23.37's equivalents wrote that binary's 0x16),
+#   so the folded bodies re-prove the tag per build.
+#
+# REFERENCE-HARNESS CROSS-CHECK (NOT a substitute for 1-5): the exact-triple
+# probe (rustls =0.23.40, default-features off + aws-lc-rs, rustls-pki-types
+# =1.14.1; rustc 1.98.1, aarch64-apple-darwin) prints
+# Result<ServerCertVerified, Error> as 64 bytes with Ok first byte 0xFF
+# (discriminant word 0x32aaabff; Err(General) = 0x0d). Identical to the
+# 0.23.38+ring probe. The TARGET'S OWN cmp remains the authority.
+# ---------------------------------------------------------------------------
+
+# ServerCertVerifier vtable census. GEOMETRY (empirical, triply
+# self-consistent across A/C/D): each vtable is
+#   [drop@vt][size@+0x08][align@+0x10][slot0@+0x18][vs_cert@+0x20]
+#   [t12@+0x28][t13@+0x30][schemes@+0x38][rrp@+0x40][rhs@+0x48][extra@+0x50]
+# The trait (rustls-0.23.40/src/verify.rs:69) declares 6 methods in order
+# verify_server_cert, verify_tls12_signature, verify_tls13_signature,
+# supported_verify_schemes, requires_raw_public_keys (default),
+# root_hint_subjects (default) — but the emitted vtables carry slots +0x18
+# and +0x50 BESIDES the six (this toolchain adds flanking slots; identity
+# unresolved — +0x18 is always a real .text fn, +0x50 is .text for A/C and a
+# .rodata pointer for D). slot +0x20 = verify_server_cert is confirmed
+# three ways: A's body decode (chain+name+Ok-write), all three t12 wrappers
+# sitting at +0x28 tail-branching to 0x3db9c8, and rrp/rhs default bodies
+# (0x3b1f20/0x20ce60 — SHARED by all four impls, the trait-proof) at
+# +0x40/+0x48. Reloc runs are 8 slots + a 16-byte hole (the NEXT vtable's
+# size/align), so a reloc run's start is the PREVIOUS vtable's +0x18 slot,
+# NOT its drop — an easy off-by-one that initially mis-assigned every method.
+#
+#   A: rustls WebPkiServerVerifier — vt 0x5b49c0, size 0x38
+#      drop=0x36053c vs_cert=0x360868 t12=0x360aa8 t13=0x360ac0
+#      schemes=0x360ad8 (Vec-allocating, 0x18-stride map of
+#      self.supported.all; wrappers read self+0x28)
+#      Structure: ParsedCertificate::try_from (bl 0x45d004), folded-crls
+#      branch, verify_server_cert_signed_by_trust_anchor_impl, then the
+#      0x3fe2d0 stage, then the Ok write.
+#      RUNTIME VERDICT (bench 1): NOT the live rejector — patched on
+#      2026-10-02, TLS through the proxy still failed with `unknown ca`.
+#      Parked below. It remains the entry to re-derive for a 4.4.x build
+#      whose fingerprint lacks the custom verifier.
+#
+#   B: reqwest NoVerifier (danger_accept_invalid_certs) — methods ICF-folded
+#      into 12-byte bodies at 0x360f40 / 0x360f4c (`mov w9,#0xff ;
+#      strb w9,[x8] ; ret`), plus its 13-scheme vec builder nearby. Their
+#      writing 0xFF independently confirms the tag. NOT the live verifier
+#      (accept-all would make unpatched TLS pass through the proxy —
+#      benches 1/2 disproved).
+#
+#   C: rustls-platform-verifier 0.7.0 — vt 0x5b4a10, size 8 (single-pointer
+#      struct: the lazily-initialized JNI context; inner fn 0x407f68 opens
+#      with UnixTime->epoch-millis (mul x23,x7,#0x3e8) and an acquire-load
+#      Once-state check). Identity evidence: JNI strings
+#      (org.rustls.platformverifier.CertificateVerifier), registry path.
+#      vs_cert=0x407c88 t12=0x407dbc t13=0x407dd8 schemes=0x407df4
+#      (reads self+0x50/+0x58 of its backend object).
+#      RUNTIME VERDICT (bench 2): NOT the live rejector either — patched,
+#      identical `unknown ca` failure. Parked below. Lesson recorded: the
+#      platform verifier is LINKED and fully implemented, but the app's
+#      default client never selects it.
+#
+#   D: custom webpki-compatible verifier — vt 0x5b1660, size 0x48  << LIVE
+#      drop=0x35e83c slot0=0x35e884 vs_cert=0x3FE558 t12=0x3fe900
+#      t13=0x3fe918 schemes=0x3fe930 (reads self+0x30 for the supported
+#      pair) rrp=0x3b1f20 rhs=0x20ce60 extra=0x4c7ef (.rodata)
+#      vs_cert structure (this yaml's patch site):
+#        - ParsedCertificate::try_from (bl 0x45d004 — the SAME helper A
+#          uses), error niche `cmn x28,#2`.
+#        - builds a &[webpki::TrustAnchor] view on its stack from the impl's
+#          OWN packed trust records: slice ptr/len at self+0x8/+0x10,
+#          0x98-byte (152 B) records, compiler-magic division by 152 and an
+#          unrolled 0x98-stride pointer fill.
+#        - dereferences an Arc at self+0x18 for a second roots source
+#          (`ldp x2,x3,[x8,#0x18]`).
+#        - stage 1: bl 0x3fe2d0 (the shared chain-verification machinery A
+#          also calls), tag test at 0x3fe858.
+#        - stage 2 (only if the chain verified): bl 0x4636b0 with the
+#          matched anchor's payload, then bl 0x3da75c, tag test at 0x3fe8dc.
+#        - Ok tail 0x3fe8e4: `mov w8,#0xff ; strb w8,[x19]`.
+#      Identity: unresolved at the crate level. The two construction sites
+#      (0x336b04 and 0x33a130, both adrp+add materializations of vt
+#      0x5b1660) sit in the reqwest 0.13.4 TLS-config builder region along
+#      with A's (0x336d08) and C's (0x337410) — so the selection between
+#      all four is data-driven in ONE builder function. Struct shape (own
+#      packed records + second-stage check) fits reqwest 0.13's built-in
+#      verifier-with-pinning or an app-level wrapper compiled into this
+#      lib. What matters operationally: it is the impl whose chain check
+#      rejects the proxy CA (CertificateError::UnknownIssuer ->
+#      alert 0x30), and stage-2 is skipped entirely by the patch.
+#      fn_range: [0x3fe558, 0x3fe900]
+
+patches:
+  - name: custom-verifier-cert-force-ok
+    status: runtime-proven      # bench 3 (2026-10-02): the app backend rustls flows intercepted, 200 OK through mitmdump
+    what: >
+      Forces the FOURTH (live) ServerCertVerifier's verify_server_cert to
+      return Ok(ServerCertVerified::assertion()) immediately by writing the
+      caller's Ok tag (0xFF in this binary — see ok_tag_convention) into the
+      sret and returning. The stub returns before ParsedCertificate::try_from
+      even runs: chain validation against the impl's own packed trust
+      records, the Arc'd roots source, and the second verification stage are
+      all skipped. verify_tls12/13_signature live in different vtable slots
+      and stay intact — the interception chain's own CertificateVerify
+      signature still validates against the presented (proxy) certificate,
+      which is exactly what we want: trust is defeated, the handshake is not.
+    entry_vaddr: 0x3fe558       # == file offset; vtable slot +0x20 value
+    fn_range: "[0x3fe558, 0x3fe900)"
+    match_bytes: 80
+    match: >-
+      fd 7b ba a9 fc 6f 01 a9 fa 67 02 a9 f8 5f 03 a9 f6 57 04 a9 f4 4f 05 a9
+      fd 03 00 91 ff ?? ?? d1 fa 03 02 aa f3 03 08 aa f7 03 03 aa 28 88 40 a9
+      f8 03 00 aa ?? ?? ?? 91 e3 03 1f 2a f6 03 07 aa f5 03 04 aa ?? ?? ?? 91
+      ?? ?? ?? 91 e1 03 08 aa
+    match_semantics: |
+      20 instructions starting at 0x3fe558 (the entry):
+        1        stp x29,x30,[sp,#-0x60]!         pre-indexed push — the same
+                 prologue signature as A's entry (coincidence of frame size,
+                 both -0x60; kept literal because it separates this window
+                 from C's, whose entry opens sub sp,#0x110)
+        2        stp x28,x27,[sp,#0x10]           KEPT LITERAL: A's window has
+                 a SINGLY-saved x28 (str x28) at this position — the pair
+                 store is the discriminator against the parked webpki entry
+        3-6      stp x26,x25 / x24,x23 / x22,x21 / x20,x19   save block
+        7        mov x29,sp
+        8        sub sp,sp,#0x340                 frame setup (size masked)
+        9        mov x26,x2                       intermediates
+        10       mov x19,x8                       sret captured — AAPCS64
+                 indirect-result reg; KEPT LITERAL (family convention:
+                 A 0x36088c, C 0x407c98, D here)
+        11       mov x23,x3                       server_name
+        12       ldp x8,x2,[x1,#8]                the pki-types 1.14
+                 CertificateDer deref — KEPT FULLY LITERAL; byte-identical
+                 in 0.23.37, 0.23.38 and both windows of this entry
+        13       mov x24,x0                       self
+        14       add x0,sp,#0x238                 parsed-cert out temp (masked)
+        15       mov w3,wzr                       (ocsp-related flag)
+        16       mov x22,x7                       now
+        17       mov x21,x4                       ocsp_response ptr
+        18-19    add x25/x27,sp,#...              local addrs (masked)
+        20       mov x1,x8                        cert slice pass-through
+                 (next instruction, past the window, is bl
+                 ParsedCertificate::try_from 0x45d004)
+      DISCRIMINATING ANCHORS vs A (the closest sibling — same helper
+      callees): the pair-save at word 2 (vs A's single x28 save), the
+      register assignment row (x26/x19/x23 vs A's x22/x19/x21), and the
+      frame arithmetic. C cannot cross-match (different prologue class).
+    patch_offset: 0
+    patch_bytes: "e9 1f 80 52 09 01 00 39 1f 05 00 f9 1f 09 00 f9 c0 03 5f d6"
+    patch_semantics: >-
+      mov w9,#0xFF ; strb w9,[x8] ; str xzr,[x8,#8] ; str xzr,[x8,#0x10] ; ret
+      (20 bytes). movz encoding: word = 0x52800000 | (0xFF << 5) | 9 =
+      0x52800fe9, little-endian bytes e9 1f 80 52.
+    why_this_shape: >
+      Same reasoning as the sibling entries: x8 holds the sret pointer at
+      entry and the stub writes through it directly; the caller dispatchers
+      read ONLY the first byte (ldrb + cmp w8,#0xff). The two `str xzr` zero
+      the first payload words defensively and stretch the sequence to 20
+      bytes — load-bearing here exactly as elsewhere in this binary: TWO
+      natural 12-byte `mov w9,#0xff ; strb w9,[x8] ; ret` sequences exist
+      (B's folded bodies at 0x360f40/0x360f4c), so the short form would
+      break trust.py's count==1 already-applied detection. The 20-byte form
+      occurs 0 times pristine. The stub's first word e9 1f 80 52 also cannot
+      re-match the pattern (whose word 0 requires the a9-class stp), so a
+      re-repack takes the already-applied path by construction.
+      Tag in w9 (x0/x8 must survive); no stack push.
+      NOTE ON THE TAG CONSTANT: 0xFF is THIS binary's tag. Re-derive per
+      binary from the caller's cmp; re-encode movz as
+      0x52800000 | (tag << 5) | Rd. Assemble with a real assembler (NDK
+      clang) and capstone-verify.
+    validation:
+      uniqueness: >
+        Pattern matches at EXACTLY ONE offset in the source binary: 0x3FE558
+        (whole-file scan through the shipped nibble-wildcard matcher).
+        Cross-matches: 0 in 4.4.6 libfjs.so and 0 in the 4.3.7 librhttp.so.
+        The 20-byte patch_bytes sequence occurs 0 times in the pristine
+        binary (idempotence-safe via count==1).
+      tag_derivation: >
+        Static derivation from this binary: dispatcher cmps 0x3f2f7c /
+        0x3f3110; the impl's OWN stage-result cmps at 0x3fe858 and 0x3fe8dc
+        with success write 0x3fe8e4; folded NoVerifier bodies
+        0x360f40/0x360f4c. Plus the exact-triple reference probe (Ok first
+        byte 0xFF). Live proof: benches 1-2 ruled A and C out; bench 3
+        exercises THIS patch — see runtime_findings.
+
+  # --- PARKED PATCH 1: rustls WebPkiServerVerifier (census A) ---------------
+  # Bench-1-rejected on this target (2026-10-02): applied at 0x360868, TLS
+  # through the proxy still failed with `tlsv1 alert unknown ca` — the live
+  # verifier is elsewhere (see ACTIVE-PATCH VERDICT). trust.py loads every
+  # "patches:" block but select_pattern returns the FIRST fingerprint match
+  # and repack applies one entry per lib: uncomment this and comment the
+  # active patch to swap. Full derivation from the 2026-10-02 version of
+  # this file; window was validated unique (1 hit at 0x360868) before
+  # parking.
+  # - name: webpki-server-cert-force-ok
+  #   status: runtime-rejected-on-this-target
+  #   entry_vaddr: 0x360868       # == file offset; vtable slot +0x20 value
+  #   fn_range: "[0x360868, 0x360aa8)"
+  #   match_bytes: 128
+  #   match: >-
+  #     fd 7b ?? a9 ?? ?? ?? f9 ?? ?? ?? a9 ?? ?? ?? a9 ?? ?? ?? a9 ?? ?? ?? a9
+  #     fd 03 ?? 91 ff ?? ?? d1
+  #     ?? 03 02 aa ?? 03 08 aa ?? 03 03 aa 28 88 40 a9 ?? 03 00 aa
+  #     a0 ?? ?? d1 ?? 03 1f 2a ?? 03 07 aa ba ?? ?? d1 f8 ?? ?? 91 ?? 03 08 aa ?? ?? ?? 9?
+  #     b9 ?? ?? f8 ?? 83 ?? 3c ?? 83 ?? 3c ?? 83 ?? 3c ?? ?? ?? f8
+  #     3f ?? ?? b1 ?? ?? ?? ad ?? ?? ?? 3d ?? ?? ?? f9 ?? ?? ?? 5? ?? ?? ?? ad ?? ?? ?? 92
+  #   patch_offset: 0
+  #   patch_bytes: "e9 1f 80 52 09 01 00 39 1f 05 00 f9 1f 09 00 f9 c0 03 5f d6"
+  #   why_parked: >
+  #     Same 20-byte stub logic as the active patch. If a future 4.4.x of
+  #     this stack drops the custom verifier (different fingerprint —
+  #     hyper-rustls' default webpki path), re-derive on that binary; do not
+  #     trust this window blindly across builds.
+  #
+  # --- PARKED PATCH 2: rustls-platform-verifier (census C) ------------------
+  # Bench-2-rejected on this target (2026-10-02): applied at 0x407c88 (the
+  # impl's own tag tests at 0x407cac/0x407da0 prove it is a real, functional
+  # vs_cert), identical `unknown ca` failure — the app's default client does
+  # not select the platform verifier despite linking it. Parked for a build
+  # that DOES wire it (fingerprint would differ; re-derive).
+  # - name: platform-verifier-cert-force-ok
+  #   status: runtime-rejected-on-this-target
+  #   entry_vaddr: 0x407c88       # == file offset; vtable slot +0x20 value
+  #   fn_range: "[0x407c88, 0x407dbc)"
+  #   match_bytes: 80
+  #   match: >-
+  #     ff ?? ?? d1 fd 7b ?? a9 ?? ?? ?? a9 ?? ?? ?? 91 f3 03 08 aa e0 03 00 91
+  #     ?? ?? ?? b4 ?? ?? ?? 9? e8 03 40 39 1f fd 03 71 ?? ?? ?? 54 ?? ?? 4? ad
+  #     ?? ?? ?? 90 ?? ?? ?? ad ?? ?? 4? ad ?? ?? ?? ad ?? ?? ?? f9 ?? ?? ?? b4
+  #     ?? ?? ?? 91 1f 20 03 d5
+  #   patch_offset: 0
+  #   patch_bytes: "e9 1f 80 52 09 01 00 39 1f 05 00 f9 1f 09 00 f9 c0 03 5f d6"
+
+anchor_swap:
+  status: not-applicable
+  why: >
+    4.3.7's librhttp carried a parsed webpki-roots TrustAnchor table
+    (135 x 0x48 struct slots) that T2 could edit slot-wise. 4.4.6's librhttp
+    does NOT: a full census of .rela.dyn (14,628 relocs) finds NO 0x48-stride
+    TrustAnchor array. The roots exist as PACKED raw-DER certificates in
+    .rodata (first blobs at file 0x5bfc0 = GlobalSign-class certs,
+    0x5c1dd = ISRG X1-class, back-to-back runs found up to 0x74458+) referenced
+    through [CertificateDer]-style 0x18-byte records {ptr(reloc), len, disc}
+    (an array of them starts near file 0x59f0e8 with lens 0x21d / 0x5ad /
+    0x584 / ... matching the packed cert sizes; disc word 0xffffffffffffffff
+    = Borrowed). The LIVE verifier (census D) additionally builds its
+    webpki::TrustAnchor views from its own 0x98-byte packed records at
+    runtime, so there is no static per-anchor struct to edit even in
+    principle — the T2 slot-swap recipe has no host, which is precisely why
+    the active patch stubs the verifier instead of swapping anchors.
+  override_path: >
+    Use the code patch above (T1). If a T2-equivalent is ever needed for this
+    target, it would have to rewrite the packed cert pool + its slice records
+    AND the 0x98-byte records the D verifier consumes (a blob-level
+    transplant, not a slot edit) — design that against the walkthrough's §8
+    method with the packed-pool geometry recorded here.
+
+runtime_findings: |
+    BENCH 1 (2026-10-02, webpki patch active): repack applied A's patch
+    (0x360868) + env-redirect shim (http://127.0.0.1:9999); no-root
+    emulator bench, adb reverse tcp:9999 -> mitmdump. RESULT: shim redirect
+    WORKS (librhttp sessions reach mitmdump), every TLS handshake FAILS:
+    `tlsv1 alert unknown ca` for *.the app backend / tmproxy.the app backend; silent
+    client disconnects for api.themoviedb.org (a different, non-rustls
+    stack — flutter/platform TLS, unaffected by any of this).
+    BENCH 2 (platform patch active, same harness): IDENTICAL failure
+    signature. Since rustls 0.23.40 maps CertificateError::UnknownIssuer ->
+    UnknownCA (error.rs:642) and UnknownCA is what mitmdump logs, both
+    benches were genuine unpatched-trust rejections — so the live
+    verify_server_cert was neither A nor C, which drove the four-verifier
+    census and the D discovery (ACTIVE-PATCH VERDICT).
+    BENCH 3 (2026-10-02, D patch @0x3fe558 active): PASS — first successful
+    end-to-end interception of this stack. Same harness (baked env shim
+    http://127.0.0.1:9999, adb reverse, mitmdump). ZERO `unknown ca` alerts
+    in the launch window; four real intercepted responses on the librhttp
+    rustls flows — 200 OK x4 (20.7k / 101k / 127k / 127b bodies) including
+    GET https://tmproxy.the app backend/api/nepu/movies4k/1 and an
+    f0748…the app backend API call — the exact hosts that failed with
+    `tlsv1 alert unknown ca` in benches 1-2. The 16 remaining handshake
+    failures in the window are ALL api.themoviedb.org / image.tmdb.org with
+    a plain client disconnect (no alert) — NOT this stack: the tmdb strings
+    live only in libapp.so (the Dart AOT snapshot), which also embeds
+    HTTPS_PROXY x2, so those flows are the env-proxy-aware Dart HttpClient
+    (BoringSSL, consults the system CA store — on API-36 the /apex store,
+    where a mitm CA is absent). Unchanged across all three benches and out
+    of scope for any rustls patch — that stack needs a CA-store-side fix,
+    not a verifier patch. Conclusion: the custom verifier (census D) was
+    the live rejecting ServerCertVerifier; this entry defeats trust on the
+    4.4.6 primary stack.
+
+prior_art:
+  source: "this repo's patterns/rustls-0.23.37_aarch64.yaml (sibling entry, same binary name, older stack)"
+  deltas_from_023_37: >
+    Tag 0x16 -> 0xFF (re-derived, never carried); first-call-at-entry prologue
+    shape vs save-block-first; folded NoVerifier bodies move from 0x2dc9f8 to
+    0x360f40 and their constant follows the tag; anchors go from a parsed
+    0x48-slot table (T2-able) to packed certs + slice records (T2 N/A); the
+    verifier population grows from one (0.23.37) to FOUR (0.23.40), and the
+    LIVE one is none of the "textbook" impls — it took two bench
+    falsifications and a caller-xref census to find it (the transferable
+    lesson: patch sites must be selected by runtime evidence or full census,
+    never by "the impl that should be live"); pki-types bumps 1.14.0 ->
+    1.14.1 (no layout change observed — the ldp x8,x2,[x1,#8] deref anchor
+    is byte-identical across all three entries). The active/commented patch
+    pair inverts between the yamls — in both cases the ACTIVE one is the
+    runtime-proven verifier for that binary.

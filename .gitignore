@@ -1,0 +1,29 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+
+# ghidra / disassembler artifacts
+*.rep/
+*.gpr
+*.gzf
+ghidra_projects/
+
+# android build artifacts
+*.apk
+*.idsig
+*.keystore
+workdir/
+
+# scratch / drop zone (apks, corpora, local artifacts)
+tmp/
+
+# os
+.DS_Store
+
+# resilient-write MCP journal
+.resilient_write/

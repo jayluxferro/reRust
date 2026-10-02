@@ -1,0 +1,306 @@
+# rustls 0.23.38 / aarch64 / ring — trust-defeat patch (libfjs stack)
+#
+# Derivation walkthrough: docs/research/rustls-trust-defeat-walkthrough.md
+# (the yaml records WHAT to patch; the walkthrough records WHY it is what it is).
+# This entry was derived 2026-10-02 from the target app 4.4.6's libfjs.so using the
+# §2 chain (roots table -> vtable -> slot +0x20) plus the per-binary ok-tag
+# re-derivation rule that the 0.23.37 entry's runtime history established.
+#
+# WHY A SEPARATE DB ENTRY: libfjs.so is the app's QuickJS (llrt) sandbox, a
+# DIFFERENT network stack from librhttp.so — no reqwest, no env-proxy support
+# (crates: hyper 1.9.0 / hyper-rustls 0.27.9 / rustls 0.23.38 / ring 0.17.14).
+# Same rustls minor as 4.3.7's librhttp (0.23.38 vs 0.23.37) but a different
+# build entirely; the 0.23.37 pattern does NOT match here (0 sites — verified),
+# which is the validation_corpus conclusion of the 0.23.37 yaml playing out.
+#
+# ADDRESS WORLD: .text lives in LOAD1 where vaddr == file offset (bias 0), so
+# entry_vaddr below is simultaneously the file offset. .data.rel.ro lives in
+# LOAD2 where file = vaddr - 0x4000 — same convention as 4.3.7's librhttp.
+# The DER pool the anchors table points into is BACK in LOAD1: reloc addends
+# there resolve with file == vaddr, no bias. (Getting this wrong silently
+# yields ASCII garbage where you expected DER — it happened twice this
+# session; see walkthrough addendum.)
+
+target:
+  crate: rustls
+  version: 0.23.38
+  arch: aarch64
+  extras:            # everything that pins codegen for this pattern
+    rustls-webpki: 0.103.13
+    rustls-pki-types: 1.14.0
+    crypto: ring     # 0.17.14
+    hyper: 1.9.0
+    hyper-util: 0.1.20
+
+derived_from:
+  binary_sha256: "53f5c5c958d4fc4107d1af100c35d9d9ab1ab973e12cb614523c86e81c84afb9"
+  binary: "libfjs.so (the target app 4.4.6 arm64-v8a), 8,530,304 B, stripped, LTO"
+  method: >
+    §2 chain, vtable-adjacency variant. The WebPkiServerVerifier vtable groups
+    sit at 0x80b690..0x80b760 in .data.rel.ro, IMMEDIATELY BEFORE the
+    webpki-roots TrustAnchor table at 0x80b770 — rustls groups its verifier
+    statics next to the roots statics (same layout habit as 4.3.7's librhttp,
+    where vtable 0x3e3b70 precedes anchors 0x3e4088). Slot addends were read
+    from .rela.dyn R_AARCH64_RELATIVE entries (the in-file slot words are 0;
+    the addresses live in the addends). Cross-checks that pinned the group:
+    (a) the schemes slot of BOTH verifier groups tail-branches to the SAME
+    free fn 0x63829c (supported_verify_schemes — impl-independent, so the
+    shared callee proves both groups are ServerCertVerifier vtables);
+    (b) the build() candidate contains a panic-Location xref to
+    rustls-0.23.38/webpki/server_verifier.rs:112 (NoRootAnchors — the path
+    string dedupes to one copy at file 0xdd213);
+    (c) convert_scheme candidate at 0x6383dc matches
+    rustls-0.23.38/webpki/verify.rs:103's signature shape.
+    Unlike 4.3.7, no unstripped reference build was needed: the slot-shape
+    disassembly (thin t12/t13 wrappers + shared schemes) was decisive.
+
+validation_corpus:
+  libfjs_4.4.6_source:      { matches: 1, at: 0x64b5a8, note: "exact-one, whole-file scan (shipped matcher)" }
+  librhttp_4.4.6:           { matches: 0, rustls: 0.23.40, crypto: aws-lc-rs, note: "different version + provider; separate DB entry" }
+  librhttp_4.3.7:           { matches: 0, rustls: 0.23.37, crypto: ring, note: "0.23.37 entry covers that binary; windows do not cross-match either direction" }
+  conclusion: >
+    Same rule as the 0.23.37 entry: the 32-instruction window is
+    (version, crypto-provider, build)-specific. Never reuse a match across
+    binaries; re-derive with the §2 chain and re-derive the tag from the
+    target's own dispatcher.
+
+# ---------------------------------------------------------------------------
+# OK-TAG CONVENTION (per-binary; 0xFF in this target — do NOT carry 0x16 over
+# from the 0.23.37 entry, and do not carry this 0xFF anywhere else either).
+#
+# Triple-confirmed FROM THIS BINARY:
+#   1. dispatcher  A (verify_server_cert sret at sp+0x10): cmp w8,#0xff at
+#      0x643fb8 — the TLS caller tests the sret's first byte against 0xFF.
+#   2. dispatcher  B (verify_tls13_signature sret at sp+0xe0):
+#      cmp w8,#0xff ; b.eq #0x644134 at 0x644060.
+#   3. producer: the matched function's own success path writes the tag with
+#      `strb w8,[x20]` at 0x64bcc8 (x20 = sret captured at entry), reached
+#      only after the inner verification results tested `cmp w8,#0xff`
+#      (0x64b85c and 0x64bc64). Two more sret tag writes at 0x64b878/0x64bc70
+#      belong to the inner verify results' dispatch.
+#
+# REFERENCE-HARNESS CROSS-CHECK (NOT a substitute for 1-3): an exact-triple
+# probe (rustls =0.23.38, default-features off + ring, rustls-pki-types
+# =1.14.0; rustc 1.98.1, aarch64-apple-darwin) prints
+# Result<ServerCertVerified, Error> as 64 bytes with Ok first byte 0xFF
+# (full Ok discriminant word 0x32aaabff little-endian; Err(General) = 0x0d).
+# The SAME probe for the 0.23.40+aws-lc-rs triple also prints 0xFF. Treat the
+# harness value as a layout-artifact sanity check only: 4.3.7's target proved
+# the tag can differ per codegen (0x16 there) — the TARGET'S OWN cmp is the
+# authority, and steps 1-3 above are that authority for this binary.
+# ---------------------------------------------------------------------------
+
+# ServerCertVerifier vtable census (resolved from .rela.dyn addends):
+#
+#   Group 1: rustls WebPkiServerVerifier — vtable group 0x80b690..0x80b760
+#      verify_server_cert        = 0x64b5a8   (this yaml's patch site)
+#      verify_tls12_signature    = 0x64bdc0   thin wrapper: mov x5,x4 ;
+#          ldp x9,x4,[x3,#8] ; ldp x6,x7,[x0,#0x30] ; mov x0,x8 ; mov x3,x9 ;
+#          b 0x638d70  (verify_tls12_signature free fn)
+#      verify_tls13_signature    = 0x64bdd8   same shape, b 0x63831c
+#      supported_verify_schemes  = 0x64bdf0   b 0x63829c
+#      Note the wrappers read self+0x30 (supported algs) here vs self+0x28 in
+#      4.4.6 librhttp — struct layout differs per build; do not share code
+#      that hardcodes those offsets.
+#      fn_range: [0x64b5a8, 0x64bdc0). Success path ends
+#      strb w8,[x20] @0x64bcc8 ; b epilogue @0x64bca8.
+#
+#   Group 2: the app's OWN custom verifier (llrt side — the llrt build path
+#      string at file 0x150d9f references llrt_crypto): vtable slots
+#      0x5d89ac (panicky wrapper), 0x5d89e0 (b 0x6d30a4),
+#      0x5d89e8 / 0x5d8a04 (t12/t13 reading self+0x50), 0x5d8a20 (schemes,
+#      b 0x63829c — SAME shared free fn as group 1, which is how this group
+#      was classified as a ServerCertVerifier at all).
+#      NOT patched: which group the live TLS config selects is unknown
+#      (see runtime_findings), and patching a dead impl would be silent.
+#
+#   No folded NoVerifier bodies in this binary (unlike 4.4.6 librhttp): the
+#   12-byte accept-all stub does not occur naturally here at all — the 20-byte
+#   patch form is still shipped for pipeline-wide uniformity and because the
+#   count==1 idempotence check is cheap.
+
+patches:
+  - name: server-cert-verify-force-ok
+    status: experimental        # static derivation + exact-triple harness proven; live bench pending
+    what: >
+      Forces rustls WebPkiServerVerifier::verify_server_cert to return
+      Ok(ServerCertVerified::assertion()) immediately by writing the caller's
+      Ok tag (0xFF in this binary — see ok_tag_convention) into the sret and
+      returning. Chain validation, hostname validation and OCSP are skipped;
+      verify_tls12/13_signature live in different vtable slots and stay
+      intact — the interception chain's own CertificateVerify signature still
+      validates, which is exactly what we want: trust is defeated, the
+      handshake is not.
+    entry_vaddr: 0x64b5a8       # == file offset; vtable slot +0x20 value
+    fn_range: "[0x64b5a8, 0x64bdc0)"
+    match_bytes: 128
+    match: >-
+      fd 7b ?? a9 ?? ?? ?? 9? ff ?? ?? d1 ff 03 ?? f9
+      ?? 03 02 aa ?? 03 08 aa ?? 03 00 aa 28 88 40 a9 ?? ?? ?? 91
+      ?? 03 07 aa ?? 03 04 aa ?? 03 03 aa ?? ?? ?? 91 ?? ?? ?? 91 ?? 03 08 aa
+      ?? ?? ?? 9? ?? ?? ?? 91 ?? ?? ?? 91 ?? ?? ?? 91 ?? ?? ?? 9?
+      ?? ?? ?? 3c ?? ?? ?? f9 ?? ?? ?? 9? ?? ?? ?? 3d ?? ?? ?? 3c
+      7f ?? ?? b1 ?? ?? ?? 3d ?? ?? ?? 3d ?? ?? ?? 3d ?? ?? ?? 5? ?? ?? ?? 3d ?? ?? ?? 3d
+    match_semantics: |
+      32 instructions starting at 0x64b5a8 (the entry):
+        1        stp x29,x30,[sp,#-0x60]!         prologue (frame size masked;
+                 this build uses -0x60 like 4.3.7's librhttp)
+        2        bl <parse_common>                FIRST-INSTRUCTION call — the
+                 signature difference vs 0.23.37's librhttp (there the save
+                 block comes first and the first call is deep in the body)
+        3        sub sp,sp,#0xe60                 giant frame (0xe60 — the
+                 webpki path building arena lives on stack in this build)
+        4        str xzr,[sp]                     zeroed local (NOT an Ok
+                 preinit — same trap as the 0.23.37 entry's instruction 9)
+        5-7      mov x25,x2 ; mov x20,x8 ; mov x26,x0
+                 arg spills — x8 = sret (ABI-fixed), x0 = self, x2 =
+                 intermediates slice
+        8        ldp x8,x2,[x1,#8]                CertificateDer deref at +8
+                 (pki-types 1.14 layout; kept fully literal — the SAME word
+                 28 88 40 a9 appears in 0.23.37 and 0.23.40 entries)
+        9-14     add x?,sp / mov x?,x7 / x?,x4 / x?,x3
+                 remaining ABI arg spills + local addresses
+        15, 19, 22  bl x3                          calls (targets masked —
+                 parse/copy/webpki-verify chain)
+        16-18    add x?,sp,#0x7f0 x2, add x1,sp,#0x200
+                 local address shuffling (masked)
+        20, 23-24, 26, 30-31  ldur/stur q-class   16-byte local copies
+                 (SIMD class kept, offsets masked)
+        21       ldr x19,[sp,#0x7f0]
+        25       adds xzr,x19,#2                  bounds/length test (Rd=xzr
+                 kept: the cmp alias)
+        29       b.<cc>                           conditional branch class
+      DISCRIMINATING ANCHORS: the first-instruction bl + the giant 0xe60
+      frame + str xzr,[sp] make this window shape distinct from both the
+      0.23.37 and 0.23.40 entries; the literal ldp x8,x2,[x1,#8] is the
+      pki-types deref common to all three.
+    patch_offset: 0
+    patch_bytes: "e9 1f 80 52 09 01 00 39 1f 05 00 f9 1f 09 00 f9 c0 03 5f d6"
+    patch_semantics: >-
+      mov w9,#0xFF ; strb w9,[x8] ; str xzr,[x8,#8] ; str xzr,[x8,#0x10] ; ret
+      (20 bytes). movz encoding: word = 0x52800000 | (0xFF << 5) | 9 =
+      0x52800fe9, little-endian bytes e9 1f 80 52.
+    why_this_shape: >
+      x8 holds the sret pointer at entry (AAPCS64 indirect-result reg); the
+      target's dispatchers read ONLY the first byte (ldrb + cmp w8,#0xff), so
+      a 1-byte tag store is what the ABI requires; the two `str xzr` after it
+      zero the first payload words defensively and — the practical reason —
+      stretch the sequence to 20 bytes for pipeline-wide uniformity with the
+      0.23.37 entry (in THIS binary the 12-byte short form has zero natural
+      occurrences, so either form would be unique; the 20-byte form is
+      shipped so the idempotence story is identical across DB entries). The
+      tag goes in w9, NOT x0/x8: x8 holds the sret pointer and must survive
+      to the strb; returning without pushing anything leaves sp/x29/x30
+      untouched.
+      NOTE ON THE TAG CONSTANT: 0xFF is THIS binary's tag (ok_tag_convention
+      steps 1-3). For any other binary, re-derive from the caller's cmp and
+      re-encode movz: word = 0x52800000 | (tag << 5) | Rd. Assemble with a
+      real assembler (NDK clang) and capstone-verify — hand-encoding has
+      produced silent garbage before (0.23.37 yaml, why_this_shape).
+    validation:
+      uniqueness: >
+        Pattern matches at EXACTLY ONE offset in the source binary: 0x64b5a8
+        (whole-file scan through the shipped nibble-wildcard matcher).
+        Cross-matches: 0 in 4.4.6 librhttp.so, 0 in 4.3.7 librhttp.so.
+        The 20-byte patch_bytes sequence occurs 0 times in the pristine
+        binary (idempotence-safe: second repack run recognizes the patch as
+        already applied via count==1).
+      tag_derivation: >
+        Static triple-derivation from this binary (dispatcher cmps 0x643fb8 /
+        0x644060, producer strb 0x64bcc8, inner tests 0x64b85c / 0x64bc64) +
+        exact-triple reference probe (Ok first byte 0xFF). What remains is
+        the live bench run: repack the 4.4.6 APK with this entry and confirm
+        the libfjs stack handshakes through the proxy. NOT YET DONE — and
+        NOTE the stack-level blocker inherited from 4.3.7 analysis: libfjs
+        honors no proxy env vars, so confirming THIS patch end-to-end needs
+        the socket-level redirect (open follow-up), not just env-proxy shim +
+        adb reverse.
+
+anchor_swap:
+  status: experimental
+  array_vaddr: 0x80b770            # .data.rel.ro; file offset 0x807770
+                                   # (LOAD2: file = vaddr - 0x4000)
+  struct_layout: >
+    pki-types 1.14 TrustAnchor in .data.rel.ro, 72-byte elements, 119 slots
+    (vaddr 0x80b770..0x80d8a0):
+      +0x00 subject_ptr        (R_AARCH64_RELATIVE; addend = DER address in
+                                the packed .rodata pool — WHICH RESOLVES IN
+                                LOAD1: file == addend, NO 0x4000 bias)
+      +0x08 subject.len
+      +0x10 BytesInner disc    (0xffffffffffffffff = Borrowed) — do not touch
+      +0x18 spki_ptr           (same reloc scheme)
+      +0x20 spki.len
+      +0x28 spki disc          (0xfffffffffffffffe on every verified slot) —
+                                do not touch
+      +0x30 nc_ptr             (present on exactly ONE slot — 32)
+      +0x38 nc.len             (0 everywhere except slot 32 = 9)
+      +0x40 nc disc            (0xffffffffffffffff except slot 118 = 0x0)
+  membership: >
+    119 anchors = the modern Mozilla root program (2023/24-era membership:
+    DigiCert TLS ECC P384 Root G5, D-TRUST BR Root CA 2 2023, TrustAsia TLS
+    RSA/ECC, SwissSign 2022, Certum Trusted Root, TUBITAK Surum 1, ...) — a
+    NEWER webpki-roots set than 4.3.7's 135-slot table (116/119 subjects
+    carry a parseable CN attribute; full CN list re-derivable with the
+    walkthrough addendum's one-liner).
+  disc_word_open_question: |
+    The third word of each BytesInner is field-consistent (subject -1, spki
+    -2, nc -1) with TWO exceptions this binary: slot 32 (TUBITAK Kamu SM SSL
+    Kok Sertifikasi - Surum 1, the one anchor WITH name_constraints, len 9)
+    has spki disc -1 like its subject, and slot 118 (Certum Trusted Root CA)
+    has nc disc 0x0 — the only 0 in the table. 4.3.7's table showed the
+    IDENTICAL structural pattern with different constants (subject ==
+    0x8000000000000000, spki == 0x8000000000000001, one spki oddball
+    borrowing the subject constant), so the word is a per-field
+    discriminant-like tag whose exact mechanism I did not resolve. The safe
+    rule — which the 4.3.7 recipe already followed — needs no mechanism
+    theory: copy the disc word of the field you are replacing from an
+    existing row of the SAME field, or leave it untouched for in-place
+    overwrites (this recipe does the latter).
+  candidate_anchor: "Certum Trusted Root CA (slot 118: RSA-4096-class SPKI 546 B, subject 122 B, nc empty/None)"
+  candidate_slots:
+    struct_vaddr: 0x80d8a0          # 0x80b770 + 118*0x48; file 0x8098a0
+    subject_der_file: 0x150b03      # 122 B (LOAD1: file == vaddr)
+    spki_der_file: 0x150b7d         # 546 B
+    subject_len_word: 0x8098a8      # struct +0x08 (file)
+    spki_len_word: 0x8098c0         # struct +0x20 (file)
+  fallback_candidates:             # same profile (SPKI 546 B, nc empty); 56 of
+                                   # 119 slots have the 546-B RSA SPKI, incl.
+                                   # the same hosts the 0.23.37 yaml used:
+    - { name: "USERTrust RSA Certification Authority", slot: 107 }
+    - { name: "COMODO RSA Certification Authority",    slot: 38 }
+    - { name: "DigiCert Trusted Root G4",              slot: 39 }
+    # slot 59 (DigiCert Assured ID Root G3) is ECDSA — SPKI 118 B, different
+    # profile, do not use for a Burp RSA chain swap.
+    # slot 32 (TUBITAK) is the ONLY anchor with name_constraints (len 9) —
+    # do not use unless you also replicate the nc record.
+  recipe: |
+    Identical to the 0.23.37 yaml's anchor_swap recipe (T2), with these
+    binary-specific substitutions: table at FILE 0x807770 (vaddr 0x80b770),
+    119 slots; DER addends resolve file == vaddr (LOAD1); subject lengths in
+    this pool run 72..210 B and SPKIs 118/290/546 B (RSA-2048 SPKI = 290 B
+    here too, not 294). Keep +0x10/+0x28/+0x40 disc words untouched for
+    in-place overwrites. All other steps (headerless-subject rule — stored
+    subjects start at the first 0x31 RDN-SET, full-SPKI rule, len-word
+    verification) carry over verbatim.
+  limitations: |
+    Same as the 0.23.37 entry, plus: WHICH verifier (rustls WebPkiServer-
+    Verifier vs the app's llrt-side custom impl) consumes this table at
+    runtime is unresolved (both vtable groups sit adjacent to it). If the
+    live stack uses the custom verifier, a swap into the rustls table changes
+    nothing observable. Treat T1 (this yaml's patch) as the primary path and
+    T2 as an experiment until the live bench says otherwise.
+
+runtime_findings: |
+    None yet (2026-10-02): this entry is static-derivation + harness only.
+    Live-bench plan (when the socket-level redirect for this stack exists):
+    repack the app_4.4.6_v8a.apk with `uv run rerust patch --proxy
+    http://127.0.0.1:9999`, install on the no-root bench, drive the app's
+    JS-sandbox network calls, confirm TLS sessions appear in the proxy.
+
+prior_art:
+  source: "none known for this stack (llrt/QuickJS embedded rustls)"
+  notes: >
+    The app's own llrt build embeds a second ServerCertVerifier impl (group 2
+    in the census) — if a future target needs the CUSTOM verifier patched
+    rather than rustls's, its slots are recorded above; the same stub shape
+    applies (sret in x8 at entry), with the tag re-derived from ITS callers.

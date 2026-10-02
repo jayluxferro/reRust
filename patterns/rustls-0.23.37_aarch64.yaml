@@ -1,0 +1,396 @@
+# rustls 0.23.37 / aarch64 — trust-defeat patches
+#
+# Derivation walkthrough: docs/research/rustls-trust-defeat-walkthrough.md
+# (the yaml records WHAT to patch; the walkthrough records WHY it is what it is).
+#
+# RUNTIME HISTORY (2026-02-14): the first version of the patch below wrote a
+# ZERO tag into the Result and was REJECTED at runtime (client still failed
+# TLS). Root cause, worked out on the unstripped LTO reference build + the
+# target's own disassembly: the Result<ServerCertVerified, Error> layout is
+# CODEGEN-SPECIFIC — Ok is tag 0x16 in this Android target (read from the
+# caller's own `cmp`), not 0 and not the 0xFF the macOS reference build uses.
+# See `ok_tag_convention` below before trusting ANY tag value recorded here.
+#
+# ADDRESS WORLD (re-verified after a tooling artifact was found and corrected —
+# see walkthrough §1): all offsets below are simultaneously FILE offsets and
+# RUNTIME vaddrs for .text/.rodata (LOAD1: vaddr == file offset, bias 0).
+# Words in .data.rel.ro live in LOAD2 where vaddr = file + 0x4000. IDA/Ghidra
+# addresses from other work on this binary (e.g. the repo owner's
+# frida-scripts) are runtime vaddrs and therefore equal our file
+# offsets directly — they reconcile with no conversion.
+
+target:
+  crate: rustls
+  version: 0.23.37
+  arch: aarch64
+  extras:            # everything that pins codegen for this pattern
+    rustls-webpki: 0.103.10
+    rustls-pki-types: 1.14.0
+    crypto: ring     # 0.17.14
+    reqwest: 0.12.28
+    hyper: 1.9.0
+
+derived_from:
+  binary_sha256: "7e59ce26ec748d9da6f2320ea3e7aa78edda0cb7bde12380d65e98e8afdbe4a7"
+  binary: "librhttp.so (rhttp Flutter client, arm64-v8a), 4,121,320 B, stripped, LTO"
+  method: >
+    Structure-match against a local unstripped LTO reference build of the same
+    crate versions (prologue/epilogue/niche-compare identical instruction for
+    instruction), then located the client-side WebPkiServerVerifier vtable via
+    the webpki-roots TrustAnchor static array and its R_AARCH64_RELATIVE relocs.
+    The vtable's ServerCertVerifier slot (+0x20) holds 0x309a1c — verify_server_cert's
+    entry, which this pattern matches at (vaddr == file offset for .text).
+
+validation_corpus:
+  librhttp_4.3.7_source:    { matches: 1, at: 0x309a1c, note: "exact-one, whole-file scan" }
+  librhttp_4.4.6:           { matches: 0, rustls: 0.23.38, crypto: aws-lc-rs,
+                              note: "individual anchors survive (Der-deref x2, niche cmps) but the 128B window restructured" }
+  libfjs_4.4.6:             { matches: 0, rustls: 0.23.38, crypto: ring,
+                              note: "same: window gone (Der-deref x16, niche cmps, no adjacency)" }
+  conclusion: >
+    The pattern is (crate-version, codegen)-specific. Anchors individually
+    survive point releases; the 32-instruction window does not. Fork per
+    (version, fingerprint) and re-derive with the walkthrough §2 chain
+    (roots table -> vtable -> slot +0x20), which is version-independent.
+
+# ---------------------------------------------------------------------------
+# The Result<ServerCertVerified, Error> ABI: one byte decides everything.
+#
+# ServerCertVerifier::verify_server_cert returns a 64-byte Result via the
+# sret register (x8 on aarch64). Every CALLER in this binary tests exactly one
+# byte of it and branches:
+#
+#     ldrb w8, [sret]        ; the tag byte
+#     cmp  w8, #0x16         ; Ok == 0x16 in THIS binary
+#     b.ne <error-path>      ; error path formats the WHOLE 64-byte sret
+#
+# Sites (this target): the TLS 1.3 ExpectCertificateVerify::handle at
+# 0x334f3c tests 0x16 at 0x335038 (verify_server_cert) and 0x335164
+# (verify_tls13_signature); the TLS 1.2 caller tests it at 0x33b544.
+# The PRODUCER agrees: WebPkiServerVerifier's own success path writes the tag
+# with `mov w8,#0x16 ; strb w8,[x19]` at 0x30a39c (x19 = sret captured at entry).
+#
+# WHY THE FIRST ATTEMPT FAILED: the original patch stored an 8-byte ZERO
+# (str xzr). Tag 0 is not Ok here — the caller took the error path and
+# formatted the mostly-uninitialized sret payload as a rustls Error, derailing
+# the handshake with a garbage error. This reproduces the runtime evidence:
+# "client disconnected during the handshake" with no useful alert, for BOTH
+# patched entries (0x309a1c and the sibling 0x2dc618 area).
+#
+# WHY YOU MUST NOT TRUST 0x16 EITHER: on the macOS reference build of the same
+# crate versions the SAME caller shape compiles to `cmp w8,#0xff` instead —
+# the tag is a codegen artifact (rustc enum layout selection), not a rustls
+# constant. The reference build has zero `cmp w?,#0x16` tests and the target
+# has zero `cmp w?,#0xff` tests for this Result; both builds test exactly one
+# convention each. RE-DERIVE THE TAG FROM THE TARGET on every new binary:
+#
+#   1. find `ldp xA,xB,[xN,#0x138]` (encoded 0xA9400000 | 39<<15 | Rt2<<10 |
+#      Rn<<5 | Rt) preceded within a few instructions by `ldr xN,[xState,#0xe0]`
+#      — the CommonState->config->verifier fat-pointer load chain; the target
+#      has exactly two such sites (0x335008, 0x335074), the harness three.
+#   2. the next `ldr x?,[xB,#0x20]` + `blr` is the verify_server_cert call
+#      (slot +0x20); the instruction pair right after the blr is the tag test.
+#      Read the cmp immediate. That value IS the Ok tag for this binary.
+#   3. sanity-check against the producer: the success path of the matched
+#      function must contain `movz w?,#<tag> ; strb w?,[x?]`.
+# ---------------------------------------------------------------------------
+
+# What each ServerCertVerifier vtable in this binary belongs to (resolved 2026-02-14
+# from .rela.dyn R_AARCH64_RELATIVE slots + constructor/dispatcher disassembly):
+#
+#   A: methods at 0x3e3b90 (fat-word 0x3e3b70), object 72 B (0x48)
+#      = rustls::WebPkiServerVerifier (struct: roots Arc + crls Vec +
+#        revocation/policy enums + WebPkiSupportedAlgorithms)
+#      verify_server_cert = 0x309a1c  (the entry this yaml patches) — LIVE:
+#      its success path writes tag 0x16 (0x30a39c) matching the dispatcher's
+#      test, and the T2 anchor-swap experiment (below) changed this verifier's
+#      failure mode, proving the webpki-roots table feeds it.
+#   B: methods at 0x3e6730 (fat-word 0x3e6710), object 56 B (0x38)
+#      = reqwest 0.12's `IgnoreHostname` (struct: RootCertStore +
+#      WebPkiSupportedAlgorithms): ParsedCertificate::try_from (= the same
+#      Cert::from_input at 0x3a418c) then ONE call to
+#      rustls::client::verify_server_cert_signed_by_trust_anchor (0x306e88);
+#      server_name/ocsp args are discarded — no hostname check. This is
+#      reqwest's danger_accept_invalid_hostnames verifier. Compiled in,
+#      selected only when the app asks for that mode; not the default client's
+#      verifier (under it, a hostname mismatch cannot fail, but the observed
+#      runtime failure is name/signature-class).
+#   C: reqwest's third impl (`NoVerifier`, accept-everything) IS linked:
+#      vtable methods at 0x3e66e0 (fat word 0x3e66c0), with all three
+#      Result-returning methods folded by identical-code-folding into the two
+#      12-byte bodies `mov w9,#0x16 ; strb w9,[x8] ; ret` at 0x2dc9f8 and
+#      0x2dca04 (their presence nearby: the 13-entry SignatureScheme vec
+#      builder at 0x2dca10 = NoVerifier::supported_verify_schemes, matches the
+#      hardcoded 13-scheme vec! in reqwest tls.rs). Note the folded bodies
+#      themselves WRITE 0x16 — an independent confirmation of the Ok tag.
+#      Not the live verifier for the app's default flow (accept-all would
+#      make unpatched TLS pass through Burp, which it does not).
+#
+#   Idempotence note: those two natural 12-byte bodies are why the shipped
+#   patch_bytes below is 20 bytes — a 12-byte stub would collide with them
+#   and break trust.py's already-applied detection.
+#
+#   Both vtables share trailing slots (+0x40 = 0x2ffe7c, +0x48 = 0x371e0c):
+#   ServerCertVerifier in 0.23.37 has SIX methods — the four core ones plus the
+#   DEFAULT requires_raw_public_keys (returns false) and root_hint_subjects
+#   (returns None); both impls use the defaults, so those slots are identical.
+#   Trait source: rustls-0.23.37/src/verify.rs:69.
+#
+#   The TLS 1.3 dispatcher (ExpectCertificateVerify::handle, 0x334f3c) loads
+#   the verifier from common_state.config+0x138 and is the ONLY consumer that
+#   matters for the tag convention — it tests 0x16 regardless of which impl
+#   serves the call, so the same stub works for either.
+
+patches:
+  - name: server-cert-verify-force-ok
+    status: experimental        # reference-build-proven; 2nd-binary validation still pending (README rules)
+    what: >
+      Forces rustls WebPkiServerVerifier::verify_server_cert to return
+      Ok(ServerCertVerified::assertion()) immediately by writing the caller's
+      Ok tag (0x16 in this binary — see ok_tag_convention) into the sret and
+      returning. Chain validation, hostname validation and OCSP are skipped;
+      verify_tls12/13_signature live in different vtable slots and stay
+      intact — the interception chain's own CertificateVerify signature still
+      validates, which is exactly what we want: trust is defeated, the
+      handshake is not.
+    entry_vaddr: 0x309a1c       # == file offset; vtable slot +0x20 value
+    fn_range: "[0x309a1c, 0x30a5f4)"
+    match_bytes: 128
+    match: >-
+      fd 7b ?? a9 f? ?? ?? a9 f? ?? ?? a9 f? ?? ?? a9 f? ?? ?? a9 f? ?? ?? a9
+      fd 03 ?? 91 ff 03 ?? d1 ff 03 ?? f9
+      f? 03 02 aa f? 03 08 aa 28 88 40 a9 f? 03 00 aa ?? ?? ?? 91
+      f? 03 07 aa f? 03 04 aa f? 03 03 aa
+      ?? ?? ?? 91 ?? ?? ?? 91 ?? 03 08 aa ?? ?? ?? 91
+      ?? ?? ?? 9? ?? ?? ?? ad
+      e8 07 41 b2 ?? ?? ?? f9 ?? ?? ?? 3c ?? ?? ?? f9
+      ?? 03 08 eb ?? ?? ?? ad ?? ?? ?? 3d ?? ?? ?? f9 ?? ?? ?? 5?
+    match_semantics: |
+      32 instructions starting at 0x309a1c (the entry):
+        1        stp x29,x30,[sp,#-N]!            prologue (frame size masked)
+        2-6      stp x28..x19 [sp,#N] (save block; registers masked, class a9 kept)
+        7        mov x29,sp
+        8        sub sp,#N                        frame setup (size masked)
+        9        str xzr,[sp,#N]                  a zeroed local / None init —
+                 NOT an Ok preinit (see correction note below)
+        10-11    mov x?,x2 ; mov x?,x8            arg spills (x8 = sret, ABI-fixed)
+        12       ldp x8,x2,[x1,#8]                CertificateDer deref at +8
+                 (pki-types 1.14 layout; kept fully literal)
+        13       mov x?,x0                        self
+        14-16    mov x?,x7 / x?,x4 / x?,x3        remaining ABI arg spills
+                 (ocsp slice, now, schemes — ABI positions, not allocator choices)
+        17-21    add x?,sp,#N ; mov x?,x?         locals/spill shuffling (masked)
+        22       stp q?,q?,[x?,#N]                locals copy
+        23       orr x8,xzr,#0x8000000000000001   THE niche discriminant —
+                 fully literal (e8 07 41 b2); if this constant moves, the
+                 Result layout changed and the patch must be re-derived
+        24-26    str / strb-class / str           locals spill (masked)
+        27       cmp x?,x8                        tag vs niche (Rm=x8 kept)
+        28-30    stp q? / ldur q? / str           spill (masked)
+        31       b.<cc> <error>                   conditional-branch class kept
+      NOTE (correction of the first revision): instruction 9 was originally
+      read as "Ok-tag preinit idiom" and the v1 patch wrote a zero tag on that
+      theory. Wrong on both counts: in this binary the Ok tag is written LATE,
+      on the success path, as `mov w8,#0x16 ; strb w8,[x19]` (0x30a39c), and
+      the CALLER tests that byte (cmp w8,#0x16 at the dispatch sites). The
+      early str xzr is just a zeroed local. The pattern itself is unaffected —
+      only the interpretation (and therefore the old patch bytes) was wrong.
+    patch_offset: 0
+    patch_bytes: "c9 02 80 52 09 01 00 39 1f 05 00 f9 1f 09 00 f9 c0 03 5f d6"
+    patch_semantics: >-
+      mov w9,#0x16 ; strb w9,[x8] ; str xzr,[x8,#8] ; str xzr,[x8,#0x10] ; ret
+      (20 bytes)
+    why_this_shape: >
+      x8 holds the sret pointer at entry (AAPCS64 indirect-result reg). The
+      caller reads ONLY the first byte (ldrb + cmp) on the success path, so a
+      1-byte tag store is what the ABI requires; the two `str xzr` after it
+      zero the first payload words defensively (the error path is never taken)
+      and — the practical reason — stretch the sequence to 20 bytes so it is
+      UNIQUE in the binary: the minimal 12-byte form (mov/strb/ret) already
+      occurs twice naturally, inside reqwest NoVerifier's folded accept-all
+      methods at 0x2dc9f8/0x2dca04, which would break the repack pipeline's
+      count==1 already-applied detection (trust.py). The tag goes in w9, NOT
+      x0/x8: those hold the sret pointer and self and must survive. Returning
+      without pushing anything leaves sp/x29/x30 untouched.
+      IMPORTANT: 0x16 is THIS binary's tag. For any other binary, re-derive
+      the tag from the caller's cmp (ok_tag_convention, step 2) and re-encode
+      movz: word = 0x52800000 | (tag << 5) | Rd. Assemble the stub with a real
+      assembler (NDK clang) — hand-encoding imm12 fields is error-prone: two
+      independent hand-encodings in this session produced silent garbage
+      (the cmp #0x16 immediate is NOT byte-aligned; word = 0x7100591F).
+    validation:
+      reference_build_end_to_end: |
+        The stub was proven on the unstripped LTO reference build with the
+        caller's tag test flipped to match (cmp w8,#0x16, word 0x7100591F —
+        the identical word the target's dispatcher uses natively): stub at
+        verify_server_cert entry, untrusted self-signed server -> cert
+        ACCEPTED, verify_tls13_signature still ran and passed, full handshake
+        + HTTP 200, exit 0. Control: same binary unpatched -> UnknownIssuer.
+        Both the minimal 12-byte form (mov/strb/ret) and the shipped 20-byte
+        form were proven this way. (The flip is a harness-only trick to make
+        the macOS codegen expect 0x16; on the target no caller edit is
+        needed — its dispatcher already tests 0x16.)
+      superseded_first_attempt: |
+        v1 (runtime-rejected 2026-02-13): patch_bytes "e0 03 08 aa 1f 01 00 f9
+        c0 03 5f d6" = mov x0,x8 ; str xzr,[x8] ; ret — wrote tag 0. Tag 0 is
+        an error variant here; the dispatcher formatted the uninitialized
+        payload as a garbage Error and the handshake died silently. Same
+        rejection for the sibling 0x2dc618 write. Kept out of patch_bytes but
+        recorded here because intermediate macOS-harness stubs (tag 0xFF,
+        8-byte and 64-byte zero variants) all failed the same way and each
+        failure mode is diagnostic: garbage "InappropriateMessage" errors =>
+        caller expected a nonzero/niche tag; clean empty-list error =>
+        payload read but tag wrong; SIGSEGV in caller => stub clobbered x8.
+      uniqueness: >
+        Pattern matches at EXACTLY ONE offset in the source binary: 0x309a1c
+        (scan over all 4,121,320 bytes; re-verified through the shipped
+        nibble-wildcard matcher, and the first 64 literal bytes are also
+        unique whole-file). The second ServerCertVerifier (reqwest
+        IgnoreHostname, 0x2dc5fc) shares from_input+niche structure but uses
+        x29-relative addressing and a shorter prologue and does NOT match.
+        Per-anchor counts for the same binary: ldp x8,x2,[x1,#8] x2,
+        mov x8,#0x8000000000000001 x234, prologue-class x6612 — uniqueness
+        comes from the combination, not any single anchor.
+  # --- INACTIVE second entry, kept ready (the loader applies the FIRST
+  # --- matching patch only; this one stays a comment until a target is seen
+  # --- running reqwest's IgnoreHostname mode, in which case swap it in for
+  # --- the entry above — the stub and tag are identical, the site differs).
+  # - name: reqwest-ignore-hostname-force-ok
+  #   what: >
+  #     Same forced-Ok for reqwest 0.12's IgnoreHostname verifier
+  #     (ServerCertVerifier impl at vtable 0x3e6730). Only relevant when the
+  #     app selects danger_accept_invalid_hostnames mode; harmless otherwise
+  #     (never called).
+  #   entry_vaddr: 0x2dc5fc
+  #   fn_range: "[0x2dc5fc, 0x2dc838)"
+  #   match_bytes: 48
+  #   match: >-
+  #     fd 7b ba a9 fc 0b 00 f9 fa 67 02 a9 f8 5f 03 a9
+  #     f6 57 04 a9 f4 4f 05 a9 fd 03 00 91 ff 03 0c d1
+  #     f6 03 02 aa f3 03 08 aa f7 03 00 aa 28 88 40 a9
+  #   match_semantics: |
+  #     12-instruction literal prefix at 0x2dc5fc: prologue (sp-0x60), x28
+  #     stored singly, x26..x19 save pairs, mov x29,sp, sub sp,#0x300,
+  #     mov x22,x2 (intermediates), mov x19,x8 (SRET capture — the give-away
+  #     that this is a sret-returning trait method), mov x23,x0 (self),
+  #     ldp x8,x2,[x1,#8] (CertificateDer deref, same anchor as entry A).
+  #     Verified unique whole-file on the source binary.
+  #   patch_offset: 0
+  #   patch_bytes: "c9 02 80 52 09 01 00 39 1f 05 00 f9 1f 09 00 f9 c0 03 5f d6"
+
+anchor_swap:
+  status: experimental
+  array_vaddr: 0x3e0088            # == file offset (LOAD2 vaddr = file+0x4000;
+                                   # first slot's subject-ptr r_offset is 0x3dfc08)
+  struct_layout: >
+    webpki::TrustAnchor in .data.rel.ro, 72-byte elements, 136 slots
+    (0x3e0088..0x3e2680):
+      +0x00 subject_ptr        (R_AARCH64_RELATIVE; addend = DER vaddr == DER file
+                                offset in the packed .rodata pool)
+      +0x08 subject.len
+      +0x10 BytesInner tag     (0x8000000000000001 = Borrowed) — do not touch
+      +0x18 spki_ptr           (same reloc scheme)
+      +0x20 spki.len
+      +0x28 spki tag           — do not touch
+      +0x30 name_constraints_ptr (0 = None on every verified root we checked)
+      +0x38 name_constraints.len (0 = None)
+      +0x40 name_constraints tag (0x8000000000000000 = None) — do not touch
+  relocation: R_AARCH64_RELATIVE   # .rela.dyn at file 0x2078, 6477 entries;
+                                   # in-place edits need NO reloc work
+  candidate_anchor: "Hellenic Academic and Research Institutions RootCA 2015 (RSA-4096 SPKI 546 B, subject 166 B, no name constraints)"
+  candidate_slots:
+    struct_vaddr: 0x3e19d8          # == file offset
+    subject_der_file: 0xb870a       # 166 B
+    spki_der_file: 0xb87b0          # 546 B
+    subject_len_word: 0x3e19e0      # struct +0x08
+    spki_len_word: 0x3e19f8         # struct +0x20
+  fallback_candidates:           # same profile (SPKI 546 B, nc None), by subject size
+    - { name: "USERTrust RSA Certification Authority",    struct_vaddr: 0x3e22d8, subject: 136 }
+    - { name: "Trustwave Global Certification Authority", struct_vaddr: 0x3e1870, subject: 136 }
+    - { name: "COMODO RSA Certification Authority",       struct_vaddr: 0x3e0ca0, subject: 133 }
+  runtime_findings: |
+    T2-only experiment (anchor swap, no code patch) changed the failure mode:
+    the client then sent an explicit `sslv3 alert bad certificate` instead of
+    dying silently. Two conclusions:
+      1. The static root table at 0x3e0088 IS consulted by the live verifier
+         (the swap had an observable effect) — the table address is right.
+      2. The remaining failure is chain/signature- or name-class (both map to
+         alert bad_certificate). Since a correct swap under the live
+         WebPkiServerVerifier should have produced a full handshake, treat the
+         result as "swap content imperfect until proven otherwise": recheck the
+         headerless-subject rule (step 1a) and the SPKI length words first.
+         Note: if the live verifier were reqwest's IgnoreHostname, a NAME
+         failure would be impossible (it never checks names) — so a
+         bad-certificate alert there would point at the SPKI copy instead.
+  recipe: |
+    T2 = overwrite one trust anchor's subject + SPKI with the interception CA's
+    (Burp's) so rustls trusts the Burp chain as if it were that root. No code
+    is patched. Steps below assume the source binary of this yaml; re-derive
+    the offsets for any other binary using the walkthrough §8 method.
+
+    0. Requirements: user CA cert (PEM/DER). Measure, don't assume: on this
+       binary Mozilla RSA-2048 SPKIs are 290 B, NOT the often-quoted 294.
+       Burp's RSA-2048 SPKI is ~294-298 B; the host root must have
+       spki_len >= that (why we pick a 546-B RSA-4096 host).
+    1. Extract from the CA cert (any DER walker, ~20 lines of stdlib python):
+       a. subject DER  — and CRITICALLY strip the outer SEQUENCE header
+          (first two bytes 0x30 LEN): webpki-roots stores Name WITHOUT the
+          outer header (every stored subject in this binary starts at the
+          first 0x31 RDN-SET). Feeding the full Name DER would compare
+          unequal to the leaf's issuer as webpki canonicalizes it.
+       b. subjectPublicKeyInfo DER — keep the FULL encoding (outer SEQUENCE
+          included; only the subject is stored headerless).
+    2. Check fit against the host: need subj_new <= 166 and spki_new <= 546
+       for the primary candidate. If the subject overflows, the spill clobbers
+       the NEXT DER in the packed pool (breaks one unrelated root) — prefer
+       the fallback candidates or accept the spill knowingly.
+    3. Overwrite in place (file offsets):
+       - copy headerless subject bytes to 0xb870a, then store its length as a
+         u64 LE at 0x3e19e0
+       - copy full SPKI bytes to 0xb87b0, store its length as u64 LE at
+         0x3e19f8
+       - do NOT touch +0x00/+0x18 pointer slots (relocs re-add the base at
+         load; DER positions unchanged), do NOT touch the tag words
+         (+0x10/+0x28/+0x40), do NOT touch name_constraints (host has none).
+    4. Verify statically: u64 at 0x3e19e0 == len(subject_written) and
+       u64 at 0x3e19f8 == len(spki_written); recompute zip hashes; install.
+    5. Runtime check (W4): the target host should now TLS-handshake through
+       Burp; `openssl s_client`-style pinning tests are meaningless here —
+       the app itself is the oracle.
+  limitations: |
+    - Trusts ONLY as Burp: any other pin/validation in app code (SPKI compare
+      in the app's own Rust glue) still fails — out of scope per SPEC.
+    - Kills one Mozilla root (Hellenic RSA 2015) for the whole app; sites
+      actually chaining to it will now fail trust. Irrelevant in a pentest lab.
+    - Der pool is packed: subject bytes longer than 166 B spill into the next
+      root's DER (documented, checkable in step 2).
+    - webpki-roots struct layout is pinned by rustls-pki-types 1.x; a major
+      bump changes the layout and this recipe silently becomes wrong — the
+      len-word checks in step 4 exist to catch that.
+
+prior_art:
+  source: "a prior community frida script for this lib (IDA-derived, runtime vaddrs)"
+  their_patch:
+    at: 0x16c060                    # runtime vaddr; == our file offset
+    write: "u32 0x14000048 (b +0x120)"
+  what_that_site_is: >
+    NOT the TLS verification path. The containing function (entry 0x16c040)
+    is flutter_rust_bridge's Dart-exception encoder for rhttp's error enum:
+    it maps an error discriminant (x8) to Dart exception NAME strings —
+    x8==3 -> "RhttpStatusCodeError" (len 20), x8==4 -> "RhttpInvalidCertificateError"
+    (len 28) — and tail-calls the shared encoder at 0x193690. It only runs
+    AFTER rustls has already failed the handshake. Patching here cannot
+    restore trust; at best it changes the Dart-side exception class.
+  target_semantics: >
+    Their write replaces the `cmp x8,#3 ; b.eq 0x16c188` dispatch
+    (0x16c060) with an unconditional `b` to 0x16c180 — the `ldr x3,[x8,#0x18] ;
+    br x3` tail block, which is only legitimate when x8 holds a payload
+    trait-object pointer (set by the other blocks via `ldp x0,x8,[x1]`).
+    Reached with x8 = the small discriminant, it dereferences near-null and
+    faults. No address-world interpretation makes it a sane no-op.
+  credit: >
+    Their work independently confirmed the FRB observation choke points
+    (0x174b7c frb_dart_fn_deliver_output, 0x1751b8 frb_pde_ffi_dispatcher_primary
+    — useful for future instrumentation hooks), and their runtime result
+    (TCP-443 connect-hook redirect still not cleanly intercepting) supports
+    the h3-quinn-over-UDP/443 bypass hypothesis in SPEC risks.
