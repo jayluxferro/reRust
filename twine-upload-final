@@ -4,4 +4,4 @@ set -euo pipefail
 cd "$(dirname "$0")"
 rm -rf dist build src/*.egg-info
 uv build
-uv run twine upload dist/*
+uvx twine upload dist/*
