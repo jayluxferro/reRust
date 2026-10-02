@@ -64,7 +64,7 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import fingerprint, trust
+from . import assets, fingerprint, trust
 
 SHIM_NAME = "librerust.so"
 
@@ -400,7 +400,7 @@ def main(argv: list[str] | None = None) -> int:
     if not Path(args.shim).exists():
         print(f"error: shim not found: {args.shim}", file=sys.stderr)
         return 2
-    patterns = None if args.no_trust else (args.patterns or Path(__file__).resolve().parents[2] / "patterns")
+    patterns = None if args.no_trust else (args.patterns or assets.patterns_dir())
     try:
         report = repack_apk(args.apk, args.shim, args.out, also_patch=args.also_patch,
                             patterns_dir=patterns, redirect=args.redirect)

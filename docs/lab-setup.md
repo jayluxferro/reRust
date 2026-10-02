@@ -67,3 +67,13 @@ etc. For cores routed by the connect-hook, the shim speaks CONNECT on the app's 
   on your own network, with or without interception.
 - QUIC/HTTP3: the connect-hook covers TCP only by design — UDP/443 QUIC flows fail
   to tunnel and the stack falls back to TCP, which is intercepted.
+
+## Hybrid Flutter+Rust apps
+
+reRust covers the Rust core. Flows that leave via Dart's own `dart:io` sockets
+(catalog code that doesn't route through the Rust client, WebView plumbing,
+some SDK traffic) terminate TLS inside `libflutter.so` with the engine's
+compiled-in roots — that half needs **[reFlutter](https://github.com/Impact-I/reFlutter)**
+(engine patch) on top. The two tools compose: reFlutter the app first, then
+reRust-patch the same build (or vice versa) — each owns a different half of the
+network stack. `rerust inspect` tells you which libs carry which half.

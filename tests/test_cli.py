@@ -67,32 +67,32 @@ def test_inspect_no_rust_libs_exit_1(tmp_path, capsys):
     assert "no Rust libraries found" in capsys.readouterr().out
 
 
-def test_patch_forwards_to_pipeline_script(apk, monkeypatch):
-    """`patch` delegates to scripts/repack_apk.py (repo checkout required).
+def test_patch_delegates_to_pipeline(apk, monkeypatch):
+    """`patch` runs rerust.pipeline.run_patch in-process (wheel-safe: no repo
+    layout assumed). The pipeline itself (NDK build, patchelf, zipalign,
+    apksigner) is integration territory — see test_repack.py/test_pipeline.py
+    and docs/research/m1_shim_repack_results.md — so here we pin the
+    delegation contract only."""
+    seen = {}
 
-    The pipeline itself (NDK build, patchelf, zipalign, apksigner) is
-    integration territory — see test_repack.py and docs/research/
-    m1_shim_repack_results.md — so here we only pin the delegation contract.
-    """
-    calls = []
+    def fake_run_patch(args):
+        seen.update(vars(args))
+        return 0
 
-    class Fake:
-        returncode = 0
-
-    monkeypatch.setattr(
-        "rerust.cli.subprocess.run", lambda cmd, *a, **kw: (calls.append(cmd), Fake())[1]
-    )
+    monkeypatch.setattr("rerust.pipeline.run_patch", fake_run_patch)
     assert main(["patch", apk, "--proxy", "http://10.0.2.2:8083"]) == 0
-    cmd = calls[0]
-    assert Path(cmd[0]).name.startswith("python")  # venv/uv abspath is fine
-    assert cmd[1].endswith("scripts/repack_apk.py")
-    assert apk in cmd
-    assert cmd[cmd.index("--proxy") + 1] == "http://10.0.2.2:8083"
-    assert cmd[cmd.index("--out") + 1].endswith("app.rerust.apk")
+    assert seen["apk"] == apk
+    assert seen["proxy"] == "http://10.0.2.2:8083"
+    assert seen["out"].endswith("app.rerust.apk")  # default out name
 
-    # explicit --out is forwarded verbatim
-    assert main(["patch", apk, "--proxy", "http://x:1", "--out", "/tmp/y.apk"]) == 0
-    assert calls[-1][calls[-1].index("--out") + 1] == "/tmp/y.apk"
+    # explicit --out is forwarded verbatim; pipeline exit code passes through
+    monkeypatch.setattr("rerust.pipeline.run_patch", lambda args: 7)
+    assert main(["patch", apk, "--proxy", "http://x:1", "--out", "/tmp/y.apk"]) == 7
+
+
+def test_patch_missing_apk_exit_2(capsys):
+    assert main(["patch", "/nonexistent/app.apk", "--proxy", "http://x:1"]) == 2
+    assert "not found" in capsys.readouterr().err
 
 
 def test_frida_emits_script_to_out(tmp_path, capsys):
@@ -156,7 +156,7 @@ def test_frida_missing_patterns_dir_degrades(tmp_path, capsys):
     rc = main(["frida", str(apk), "--proxy", "http://10.0.2.2:8083",
                "--patterns", str(tmp_path / "nope"), "--out", str(tmp_path / "a.js")])
     assert rc == 0
-    assert "pattern DB dir not found" in capsys.readouterr().err
+    assert "no pattern DB found" in capsys.readouterr().err
 
 
 def test_frida_input_errors(tmp_path, capsys):

@@ -13,12 +13,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import sys
 import zipfile
 from pathlib import Path
 
-from . import frida_script, trust
+from . import assets, frida_script, pipeline, trust
 from .apk_inspect import inspect_apk, read_native_libs
 
 # Exit codes for `inspect`: 0 = report produced; 1 = ran fine but no Rust
@@ -57,24 +56,12 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 def cmd_patch(args: argparse.Namespace) -> int:
     """Repack with the env-proxy shim + rustls trust patch (SPEC M1 + T1).
 
-    Delegates to the pipeline script, which owns the SDK/NDK tool locations —
-    so `patch` requires a repo checkout, not just an installed package.
+    Runs rerust.pipeline in-process — works from a repo checkout AND an
+    installed wheel (shim sources and the pattern DB resolve via rerust.assets).
     """
-    script = Path(__file__).resolve().parents[2] / "scripts" / "repack_apk.py"
-    if not script.exists():
-        print(f"error: {script} not found (patch requires a repo checkout)", file=sys.stderr)
-        return 2
-    out = args.out or str(Path(args.apk).with_suffix("")) + ".rerust.apk"
-    cmd = [sys.executable, str(script), args.apk, "--proxy", args.proxy, "--out", out]
-    if args.no_bake:
-        cmd += ["--no-bake"]
-    if args.shim:
-        cmd += ["--shim", args.shim]
-    if args.ndk:
-        cmd += ["--ndk", args.ndk]
-    if args.no_trust:
-        cmd += ["--no-trust"]
-    return subprocess.run(cmd).returncode
+    if not args.out:
+        args.out = str(Path(args.apk).with_suffix("")) + ".rerust.apk"
+    return pipeline.run_patch(args)
 
 
 def cmd_frida(args: argparse.Namespace) -> int:
@@ -99,8 +86,8 @@ def cmd_frida(args: argparse.Namespace) -> int:
         print(f"error: {target} is not an APK/zip or a native library", file=sys.stderr)
         return 2
 
-    db = Path(args.patterns or Path(__file__).resolve().parents[2] / "patterns")
-    if db.is_dir():
+    db = Path(args.patterns) if args.patterns else assets.patterns_dir()
+    if db is not None and db.is_dir():
         try:
             entries = trust.load_patterns(db)
         except Exception as e:  # malformed yaml must not kill the emitter
@@ -108,7 +95,8 @@ def cmd_frida(args: argparse.Namespace) -> int:
             return 2
     else:
         entries = []
-        print(f"warning: pattern DB dir not found ({db}) — agent will be env+observe only", file=sys.stderr)
+        print("warning: no pattern DB found (repo or packaged) — agent will be "
+              "env+observe only", file=sys.stderr)
 
     specs, warnings, saw_rust = frida_script.build_patches(libs, entries)
     if not saw_rust:
@@ -147,13 +135,7 @@ def main(argv: list[str] | None = None) -> int:
     pi.add_argument("--json", action="store_true", help="emit the machine-readable document (schema: rerust.apk_inspect)")
     pi.set_defaults(fn=cmd_inspect)
     pp = sub.add_parser("patch", help="repackage with the env-proxy shim + rustls trust patch (M1 + T1)")
-    pp.add_argument("apk")
-    pp.add_argument("--proxy", required=True, help="proxy URL baked into the shim, e.g. http://10.0.2.2:8083")
-    pp.add_argument("--out", help="output APK path (default: <input>.rerust.apk)")
-    pp.add_argument("--no-bake", action="store_true", help="file-based shim config (/data/local/tmp/rerust_proxy) instead of baked proxy")
-    pp.add_argument("--shim", help="use a prebuilt shim .so instead of building one")
-    pp.add_argument("--ndk", help="Android NDK directory (default: bundled r28)")
-    pp.add_argument("--no-trust", action="store_true", help="skip the rustls trust patch (shim-only repack)")
+    pipeline.add_patch_args(pp)
     pp.set_defaults(fn=cmd_patch)
     pf = sub.add_parser("frida", help="emit a Frida runtime agent (env-proxy + trust patch + observer)")
     pf.add_argument("target", help="APK/zip or native lib to fingerprint")

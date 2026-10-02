@@ -1,6 +1,6 @@
 [project]
 name = "rerust"
-version = "0.1.0"
+version = "0.1.1"
 description = "Traffic interception for Rust-based mobile apps — reFlutter for rustls/reqwest cores"
 readme = "README.md"
 license = "MIT"
@@ -37,3 +37,9 @@ testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rerust"]
+
+# Package the asset trees so an installed wheel works without a repo checkout.
+# Resolution at runtime: rerust.assets (repo checkout preferred, else these).
+[tool.hatch.build.targets.wheel.force-include]
+"shim" = "rerust/assets/shim"
+"patterns" = "rerust/assets/patterns"
