@@ -72,10 +72,10 @@ rerust frida <apk|lib> --proxy URL   # emit the runtime agent
 
 ## Success criteria
 
-- v0: a real-world Flutter+Rust app's rustls core decrypts through Burp on an unrooted
-  production-image emulator, with the patched APK installing and running normally.
-- Status: **achieved** (both the reqwest half and the embedded-runtime half; see git
-  history and docs).
+- A real-world Flutter+Rust app's rustls core decrypts through Burp on an unrooted
+  production-image emulator, with the patched APK installing and running normally —
+  both the reqwest half and the embedded-runtime half.
+- Status: **achieved and shipped as [v0.1.0](https://github.com/jayluxferro/reRust/releases/tag/v0.1.0)**.
 
 ## Risks / honest limits
 
