@@ -27,3 +27,6 @@ tmp/
 
 # resilient-write MCP journal
 .resilient_write/
+
+# internal publish convention (kept local)
+twine-upload-final

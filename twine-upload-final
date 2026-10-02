@@ -1,7 +1,0 @@
-#!/bin/bash
-# Publish to PyPI: clean build + twine upload (mirrors the reFlutter convention).
-set -euo pipefail
-cd "$(dirname "$0")"
-rm -rf dist build src/*.egg-info
-uv build
-uvx twine upload dist/*
