@@ -1,16 +1,23 @@
 #!/bin/sh
-# Build the reRust env-proxy shim for Android.
+# Build the reRust env-proxy shim for Android or iOS.
 #
-# usage: build.sh [-o OUT.so] [--proxy URL] [--hook-connect[=TARGET]]
+# usage: build.sh [-o OUT] [--platform android|ios-sim|ios-device]
+#                 [--proxy URL] [--hook-connect[=TARGET]]
 #                 [--hook-port N] [--hook-timeout MS] [--api N] [--ndk DIR]
 #                 [--clean]
+#
+#   --platform    android (default): NDK aarch64, librerust.so
+#                 ios-sim: xcrun iphonesimulator SDK, arm64, librerust.dylib
+#                 ios-device: iphoneos SDK, arm64, ad-hoc codesigned
 #
 #   --proxy URL   bake the proxy into the binary (-DRERUST_PROXY_BAKED).
 #                 This is the flagship path: one .so, self-contained, no
 #                 runtime file needed. Without it the shim reads
 #                 /data/local/tmp/rerust_proxy at startup (adb-pushable,
 #                 but blocked by SELinux on some production images — see
-#                 docs/research/m1_shim_repack_results.md).
+#                 docs/research/m1_shim_repack_results.md). On iOS there is
+#                 no runtime file at all: baked proxy or getenv override
+#                 only (the app sandbox has no pushable scratch space).
 #
 #   --hook-connect[=TARGET]
 #                 additionally build the M2.5 connect() interposer
@@ -18,27 +25,38 @@
 #                 plumbing (embedded JS runtimes). TARGET is ipv4:port or a
 #                 bare port (default 127.0.0.1:9999 — the adb-reverse bench
 #                 endpoint); the file /data/local/tmp/rerust_hook overrides
-#                 at runtime, same resolution order as the proxy. Combinable
-#                 with --proxy: one env+hook build serves every Rust lib.
+#                 at runtime (Android only), same resolution order as the
+#                 proxy. Combinable with --proxy: one env+hook build serves
+#                 every Rust lib.
 #                 NOTE: hook builds export connect() — repack.py must place
 #                 the shim BEFORE libc.so in DT_NEEDED or bionic resolves
-#                 libc's connect and the hook silently never fires.
+#                 libc's connect and the hook silently never fires. The iOS
+#                 analog is different: the injection is LC_LOAD_DYLIB, and
+#                 dyld resolves interposed symbols by dependency ORDER too,
+#                 but the shim is a Frameworks/ dylib loaded first by the
+#                 main executable, which is exactly the position we want.
 #   --hook-port N   destination port to intercept (default 443).
 #   --hook-timeout MS  tunnel-establishment deadline (default 1500).
 #
-# Output default: /tmp/rerust-work/librerust.so (binaries are never committed).
+# Output default: /tmp/rerust-work/librerust.(so|dylib) (binaries are never
+# committed).
 #
 # Why aarch64 + API 24: the shim targets repacked release APKs whose native
 # cores are arm64-only in practice (our benchmark target ships arm64-v8a
 # exclusively); API 24 covers every device that can run them and is the first
 # API with the modern linker namespace semantics the injection relies on.
+# iOS: simulator builds are the lab target (no FairPlay, shares the host
+# network — bake the host's LAN IP as --proxy); device builds additionally
+# need the dylib ad-hoc signed or dyld refuses it, done here so the repack
+# step stays signature-only for the app bundle.
 set -eu
 
 PROXY=""
 HOOK_TARGET=""
 HOOK_PORT=443
 HOOK_TIMEOUT=1500
-OUT="/tmp/rerust-work/librerust.so"
+PLATFORM=android
+OUT=""
 API=24
 # NOTE: ANDROID_NDK_HOME is deliberately *not* consulted first — on this
 # machine it points at an ancient NDK 21 in a different SDK root; the pinned
@@ -57,6 +75,7 @@ if [ ! -d "$NDK" ] && [ -n "${ANDROID_NDK_HOME:-}" ]; then NDK="$ANDROID_NDK_HOM
 while [ $# -gt 0 ]; do
     case "$1" in
         -o) OUT="$2"; shift 2 ;;
+        --platform) PLATFORM="$2"; shift 2 ;;
         --proxy) PROXY="$2"; shift 2 ;;
         --hook-connect)
             HOOK_TARGET="127.0.0.1:9999"; shift ;;
@@ -84,15 +103,19 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-PREBUILT="$NDK/toolchains/llvm/prebuilt"
-if [ ! -d "$PREBUILT" ]; then
-    echo "error: NDK toolchain not found under $PREBUILT (set --ndk or ANDROID_NDK_HOME)" >&2
-    exit 1
+case "$PLATFORM" in
+    android) [ -n "$OUT" ] || OUT="/tmp/rerust-work/librerust.so" ;;
+    ios-sim) [ -n "$OUT" ] || OUT="/tmp/rerust-work/librerust.dylib" ;;
+    ios-device) [ -n "$OUT" ] || OUT="/tmp/rerust-work/librerust.dylib" ;;
+    *) echo "unknown platform: $PLATFORM (android|ios-sim|ios-device)" >&2; exit 2 ;;
+esac
+if [ "$PLATFORM" != android ]; then
+    # NDK/API flags are Android-only; silently accepting them would bake a
+    # wrong mental model into scripts that drive both platforms.
+    for a in "--api" "--ndk"; do :; done
+    case "$*" in *--api*) echo "warning: --api ignored for $PLATFORM" >&2 ;; esac
+    case "$*" in *--ndk*) echo "warning: --ndk ignored for $PLATFORM" >&2 ;; esac
 fi
-# The prebuilt dir name follows the *host* arch (darwin-x86_64 even on Apple
-# Silicon — NDK ships x64 toolchain binaries that run fine under Rosetta).
-HOST_DIR=$(ls "$PREBUILT" | head -1)
-CC="$PREBUILT/$HOST_DIR/bin/aarch64-linux-android${API}-clang"
 
 BAKE_ARGS=""
 if [ -n "$PROXY" ]; then
@@ -115,14 +138,52 @@ if [ -n "$HOOK_TARGET" ]; then
 fi
 
 mkdir -p "$(dirname "$OUT")"
-# -llog: __android_log_print bootstrap evidence. Everything else is freestanding
-# libc so the shim stays tiny and adds no new dependency surface to the app.
-"$CC" -O2 -fPIC -shared -Wall -Wextra \
-    -Wl,-soname,librerust.so \
-    $BAKE_ARGS $HOOK_ARGS \
-    -o "$OUT" \
-    "$(dirname "$0")/librerust.c" \
-    -llog
+
+if [ "$PLATFORM" = android ]; then
+    PREBUILT="$NDK/toolchains/llvm/prebuilt"
+    if [ ! -d "$PREBUILT" ]; then
+        echo "error: NDK toolchain not found under $PREBUILT (set --ndk or ANDROID_NDK_HOME)" >&2
+        exit 1
+    fi
+    # The prebuilt dir name follows the *host* arch (darwin-x86_64 even on Apple
+    # Silicon — NDK ships x64 toolchain binaries that run fine under Rosetta).
+    HOST_DIR=$(ls "$PREBUILT" | head -1)
+    CC="$PREBUILT/$HOST_DIR/bin/aarch64-linux-android${API}-clang"
+
+    # -llog: __android_log_print bootstrap evidence. Everything else is
+    # freestanding libc so the shim stays tiny and adds no new dependency
+    # surface to the app.
+    "$CC" -O2 -fPIC -shared -Wall -Wextra \
+        -Wl,-soname,librerust.so \
+        $BAKE_ARGS $HOOK_ARGS \
+        -o "$OUT" \
+        "$(dirname "$0")/librerust.c" \
+        -llog
+else
+    # iOS: the simulator SDK needs only Xcode (no NDK, no Apple developer
+    # account). Deployment target 15.0 matches the Xcode 27 floor the lab
+    # apps already build with. -dynamiclib (not -shared) is the canonical
+    # apple dylib flag. install_name uses @rpath so the same dylib works
+    # from an .app's Frameworks/ dir regardless of bundle name — the
+    # LC_LOAD_DYLIB written by the repack is what dyld actually resolves,
+    # this only keeps the dylib self-describing.
+    case "$PLATFORM" in
+        ios-sim)    XSDK=iphonesimulator; TARGET="arm64-apple-ios15.0-simulator" ;;
+        ios-device) XSDK=iphoneos;        TARGET="arm64-apple-ios15.0" ;;
+    esac
+    xcrun -sdk "$XSDK" clang -O2 -fPIC -dynamiclib -Wall -Wextra \
+        -target "$TARGET" \
+        -Wl,-install_name,@rpath/librerust.dylib \
+        $BAKE_ARGS $HOOK_ARGS \
+        -o "$OUT" \
+        "$(dirname "$0")/librerust.c"
+
+    if [ "$PLATFORM" = ios-device ]; then
+        # Device dylibs must be signed or dyld kills the process on load;
+        # ad-hoc ("-") suffices for lab installs via a repacked IPA.
+        codesign -f -s - "$OUT"
+    fi
+fi
 
 echo "built: $OUT"
 ls -l "$OUT"

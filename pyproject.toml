@@ -1,6 +1,6 @@
 [project]
 name = "rerust"
-version = "0.1.1"
+version = "0.2.0"
 description = "Traffic interception for Rust-based mobile apps — reFlutter for rustls/reqwest cores"
 readme = "README.md"
 license = "MIT"

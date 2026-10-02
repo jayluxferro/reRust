@@ -12,10 +12,13 @@ vars that Android never sets.
 reRust makes those apps transparent again:
 
 - `rerust inspect app.apk` — fingerprint the Rust core (exact crate versions, TLS stack,
-  trust store flavor) straight from a stripped binary.
-- `rerust patch app.apk --proxy http://127.0.0.1:9999` — repack with an env-proxy shim +
+  trust store flavor) straight from a stripped binary. `.ipa` and bare Mach-O images work
+  too.
+- `rerust patch app.apk|.ipa --proxy http://127.0.0.1:9999` — repack with an env-proxy shim +
   fingerprint-gated trust patch (+ optional `connect()` hook for cores without env
-  plumbing); debug-signed output that runs on **unrooted** devices.
+  plumbing); debug-signed APK output that runs on **unrooted** devices, ad-hoc re-signed
+  ipa output for the iOS pipeline (simulator-validated; see the iOS section of
+  [docs/lab-setup.md](docs/lab-setup.md)).
 - `rerust frida <apk|lib> --proxy URL` — the same interception at runtime, no repack.
 
 ```bash
@@ -41,7 +44,8 @@ every app on that release — and entries can be farmed proactively against self
 pinned targets ([docs/corpus-farming.md](docs/corpus-farming.md)).
 
 Docs: [SPEC.md](SPEC.md) · [lab setup](docs/lab-setup.md) ·
-[pattern derivation](docs/pattern-derivation.md) · [corpus farming](docs/corpus-farming.md)
+[pattern derivation](docs/pattern-derivation.md) · [corpus farming](docs/corpus-farming.md) ·
+[iOS Mach-O walkthrough](docs/research/ios-macho-walkthrough.md)
 
 Lineage: from the maintainer of [reFlutter](https://github.com/Impact-I/reFlutter).
 

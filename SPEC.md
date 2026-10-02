@@ -86,7 +86,12 @@ rerust frida <apk|lib> --proxy URL   # emit the runtime agent
 - The proxy's TLS fingerprint is not the app's; CDN-side bot defenses may challenge.
 - Lab networks that sinkhole ad domains will trip in-app "adblock detection" gates —
   that is the network, not the tool.
-- iOS: same design via Mach-O patch + dylib injection + codesign. Planned.
+- iOS: same three mechanisms on Mach-O — dylib shim injected via LC_LOAD_DYLIB
+  (optool/insert_dylib) instead of DT_NEEDED, per-fingerprint trust patterns derived
+  against the ios-arm64 slice (method transfers unchanged), codesign + IPA repack.
+  Simulator bench needs no FairPlay decryption and reaches the host proxy at
+  127.0.0.1 directly; App Store device builds require dump-decryption of the main
+  executable first. IN PROGRESS.
 
 ## Decisions
 

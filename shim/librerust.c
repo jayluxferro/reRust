@@ -74,9 +74,22 @@
  * (remove + re-add) for hook builds. Verified end-to-end on-device; if the
  * hook logs nothing, check the NEEDED order first (readelf -d).
  *
- * Log line(s) make the hook observable from the host (`adb logcat -s reRust`):
+ * Log line(s) make the hook observable from the host (`adb logcat -s reRust`,
+ * or stderr via `xcrun simctl launch --console-pty` on the iOS simulator):
  * one at ctor (armed/inactive) plus rate-limited per-flow lines. Unconfigured
  * M1-only builds stay fully silent so the shim is a no-op vs. the original.
+ *
+ * == iOS build (shim/build.sh --platform ios-sim|ios-device) ==
+ * The same source compiles for Apple with three platform deltas:
+ *   - logging goes to stderr (no liblog); visible through the sim console,
+ *   - the /data/local/tmp config-file fallbacks do not exist there — proxy
+ *     resolution is RERUST_PROXY env (lab override, wins over baked) then
+ *     the baked value; the env override is checked on Android too (an env
+ *     var an Android app never carries in practice, so behavior is
+ *     unchanged there; it lets one binary serve any lab proxy),
+ *   - the connect-hook needs SO_NOSIGPIPE (no MSG_NOSIGNAL on Darwin).
+ * Injection is LC_LOAD_DYLIB into the main executable (repack_ipa.py), not
+ * DT_NEEDED — the DT_NEEDED ordering notes above are Android-only.
  */
 #include <arpa/inet.h>
 #include <dlfcn.h>
@@ -94,7 +107,22 @@
 #include <time.h>
 #include <unistd.h>
 
+#if defined(__ANDROID__)
 #include <android/log.h>
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "reRust", __VA_ARGS__)
+#else
+#define LOGI(...)                          \
+    do {                                   \
+        fprintf(stderr, "[reRust] " __VA_ARGS__); \
+        fputc('\n', stderr);               \
+    } while (0)
+#endif
+
+/* Darwin has no MSG_NOSIGNAL; SIGPIPE is disabled per-socket instead
+ * (SO_NOSIGPIPE is set on every hooked fd before the preamble I/O). */
+#if defined(__APPLE__) && !defined(MSG_NOSIGNAL)
+#define MSG_NOSIGNAL 0
+#endif
 
 #ifndef RERUST_PROXY_BAKED
 #define RERUST_PROXY_BAKED ""
@@ -203,8 +231,13 @@ static void hook_init(void) {
     resolve_real_connect();
 
     char spec[128];
-    const char *cfg = RERUST_HOOK_BAKED;
+    /* Same resolution order as the M1 proxy: env override (lab), baked,
+     * then — Android only — the adb-pushable config file. */
+    const char *cfg = getenv("RERUST_HOOK");
+    if (!cfg || !*cfg)
+        cfg = RERUST_HOOK_BAKED;
     if (!*cfg) {
+#ifndef __APPLE__
         FILE *f = fopen(HOOK_CFG_FILE, "r");
         if (!f) {
             /* A hook build that found no target is a bench misconfiguration
@@ -221,6 +254,10 @@ static void hook_init(void) {
         fclose(f);
         spec[strcspn(spec, "\r\n")] = '\0';
         cfg = spec;
+#else
+        LOGI("connect-hook compiled in but unconfigured (no RERUST_HOOK, no baked target) — inactive");
+        return;
+#endif
     }
 
     char buf[128];
@@ -447,6 +484,12 @@ int connect(int fd, const struct sockaddr *addr, socklen_t len) {
     struct sockaddr_storage pss;
     socklen_t plen = build_proxy_addr(&pss, af);
     int rc = g_real_connect(fd, (struct sockaddr *)&pss, plen);
+#ifdef SO_NOSIGPIPE
+    /* Darwin has no MSG_NOSIGNAL; keep the preamble I/O from SIGPIPE-killing
+     * the app if the proxy dies mid-handshake. Harmless elsewhere. */
+    int nosigpipe = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof nosigpipe);
+#endif
     if (rc != 0 && errno != EINPROGRESS) {
         int e = errno; /* proxy unreachable — the honest failure */
         if (log_flow)
@@ -506,21 +549,30 @@ int connect(int fd, const struct sockaddr *addr, socklen_t len) {
 
 __attribute__((constructor))
 static void rerust_init(void) {
-    char buf[512];
-    const char *proxy = RERUST_PROXY_BAKED;
-    if (!*proxy) {
-        FILE *f = fopen("/data/local/tmp/rerust_proxy", "r");
-        if (f) {
-            if (fgets(buf, sizeof buf, f)) {
-                buf[strcspn(buf, "\r\n")] = '\0';
-                proxy = buf;
+    /* Resolution order: RERUST_PROXY env override (lab flexibility — one
+     * binary, any proxy; Android apps never carry this var in practice, so
+     * production behavior is unchanged), then the baked value, then the
+     * adb-pushable config file (Android only — no such path on iOS). */
+    const char *proxy = getenv("RERUST_PROXY");
+    if (!proxy || !*proxy) {
+        proxy = RERUST_PROXY_BAKED;
+        if (!*proxy) {
+#ifndef __APPLE__
+            char buf[512];  /* config-file readback — Android only */
+            FILE *f = fopen("/data/local/tmp/rerust_proxy", "r");
+            if (f) {
+                if (fgets(buf, sizeof buf, f)) {
+                    buf[strcspn(buf, "\r\n")] = '\0';
+                    proxy = buf;
+                }
+                fclose(f);
             }
-            fclose(f);
+#endif
         }
     }
     if (*proxy) {
         set_proxy_vars(proxy);
-        __android_log_print(ANDROID_LOG_INFO, "reRust", "proxy set: %s", proxy);
+        LOGI("proxy set: %s", proxy);
     }
 
 #ifdef RERUST_HOOK_CONNECT

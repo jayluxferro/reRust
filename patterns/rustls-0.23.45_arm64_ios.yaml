@@ -1,0 +1,214 @@
+# rustls 0.23.45 / arm64 / iOS — trust-defeat patch (Flutter + FRB Rust core)
+#
+# Derivation walkthrough: docs/research/ios-macho-walkthrough.md (the yaml
+# records WHAT to patch; the walkthrough records WHY it is what it is). This
+# entry was derived 2026-10-02 from a self-built Flutter app's Rust core
+# framework (the first iOS entry in this DB) using the Mach-O analog of the
+# §2 chain in docs/pattern-derivation.md: panic-Location strings -> dyld_info
+# fixups -> Location structs -> ADRP/ADD xrefs -> function bounds.
+#
+# WHY A SEPARATE DB ENTRY, AND A NEW ARCH SPELLING: this is a Mach-O slice,
+# not an ELF .so. The `arch` below is "arm64-ios" — the arm64 slice of an iOS
+# binary gets the -ios suffix at slice-classification time, so select_pattern
+# can never fire this entry on an Android aarch64 lib (or vice versa) even
+# though both are AArch64 code. The codegen differs completely anyway: Mach-O
+# sections, chained fixups instead of R_AARCH64_RELATIVE, a different LLVM
+# line. Derived from a SIMULATOR build (release not available for the sim
+# target — Apple builds simulator slices debug-flavored); a DEVICE build of
+# the same app will need its own entry once derived — do not assume this
+# window transfers.
+
+target:
+  crate: rustls
+  version: 0.23.45
+  arch: arm64-ios        # Mach-O slice spelling; gates against Android aarch64
+  extras:                # everything that pins codegen for this pattern
+    rustls-webpki: 0.103.15
+    rustls-pki-types: 1.15.1
+    crypto: ring         # tls_stack classifies "rustls+ring+aws-lc" (reqwest's
+                         # ring feature + aws-lc-rs linked as the FRB default
+                         # provider); 'ring' is the substring test that passes
+    hyper: 1.6.0
+    hyper-util: 0.1.17
+
+derived_from:
+  binary_sha256: "e4537d89048e30a8c40f49b6414a9be4deca1473d36a079e8756b6b628a0997d"
+  binary: >
+    the target app's own iOS-simulator build — the Flutter Rust core framework
+    dylib, arm64 thin slice, 37,786,832 B, release-pipeline simulator artifact
+    (mangled Rust symbols retained; simulator builds are not stripped the way
+    device builds are). rustls entered via reqwest 0.12.28 /
+    hyper-rustls 0.27.10 / tokio-rustls 0.26.6, trust flavor webpki-roots.
+  method: >
+    Mach-O §2 chain, panic-Location variant (no vtable walk needed — the
+    symbol survived, but the byte window below is deliberately
+    symbol-independent so the pattern survives a device-grade strip):
+    (a) grep the embedded panic-string pool for the rustls server_verifier.rs
+    path (one deduped copy, 108 B tail);
+    (b) `xcrun dyld_info -fixups` lists every rebase target — the panic
+    Location structs {ptr,len,line,col} (24 B, __DATA_CONST where file offset
+    == vmaddr) that point at that string carry line/col: lines 121/127
+    (build()'s NoRootAnchors/Ok) and 211/240/253/263/276 (the try_from chain
+    and the four `?` operators of verify_server_cert in 0.23.45's source);
+    (c) scan __text for ADRP/ADD pairs resolving to those Location addresses;
+    the single function containing the L263 and L276 xrefs is
+    WebPkiServerVerifier::verify_server_cert (mangled symbol confirms;
+    its Err paths call from_residual with exactly those Locations);
+    (d) ok-tag re-derivation per the per-binary rule (see ok_tag_convention);
+    (e) 32-instruction entry window with register/offset columns masked.
+
+validation_corpus:
+  derivation_binary_ios_sim: { matches: 1, at: 0x2aaa98, note: "exact-one, whole-slice scan (shipped matcher)" }
+  same_framework_x86_64_slice: { matches: 0, note: "arm64-only encodings; also unreachable via the arm64-ios arch gate" }
+  rustls-0.23.37_aarch64:   { matches: 0, note: "Android ELF windows do not cross-match this Mach-O slice byte-wise (measured)" }
+  rustls-0.23.38_aarch64_ring: { matches: 0, note: "measured 0 sites; and arch gating ('aarch64' != 'arm64-ios') keeps them mutually unselectable" }
+  rustls-0.23.40_aarch64_awslc: { matches: 0, note: "measured 0 sites; same arch-gate argument" }
+
+ok_tag_convention: |
+  Re-derived for THIS binary (never assume a prior entry's tag):
+  1. The Ok-return producer sits just before the epilogue of
+     verify_server_cert: `ldr x9,[sp,#0xe0] ; mov w8,#0xff ; strb w8,[x9]`
+     (0x2ab03c..0x2ab044) — x9 reloads the sret pointer spilled at entry,
+     and the ONLY thing written is the 1-byte discriminant 0xFF (the Ok
+     payload, ServerCertVerified::assertion(), is a ZST).
+  2. Both in-function dispatchers read the tag back with the same value:
+     `ldrb w8,[sp,#X] ; uxtb w8,w8 ; subs w8,w8,#0xff ; cset x8,ne ; tbnz`
+     after the Try::branch calls — 0xFF falls to the Ok path, anything else
+     Err-propagates through from_residual carrying the L263/L276 panic
+     Locations (the two `?` operators).
+  3. Result: tag 0xFF, same as the 0.23.37/0.23.38/0.23.40 Android binaries —
+     4/4 so far. The stub below is therefore byte-identical to the 0.23.38
+     entry's; that is a coincidence of conventions, not an assumption — the
+     steps above were re-run on this slice before encoding.
+
+patches:
+  - name: server-cert-verify-force-ok
+    status: live-validated    # static derivation + whole-slice uniqueness +
+                              # live simulator run (runtime_findings below)
+    what: >
+      Forces rustls WebPkiServerVerifier::verify_server_cert to return
+      Ok(ServerCertVerified::assertion()) immediately by writing the caller's
+      Ok tag (0xFF in this binary — see ok_tag_convention) into the sret and
+      returning. Chain validation, hostname validation and OCSP are skipped;
+      verify_tls12/13_signature live in different vtable slots and stay
+      intact — the interception chain's own CertificateVerify signature still
+      validates, which is exactly what we want: trust is defeated, the
+      handshake is not.
+    entry_vaddr: 0x2aaa98     # == file offset: __TEXT has fileoff == vmaddr
+                              # in this dylib (base 0)
+    fn_range: "[0x2aaa98, 0x2ab06c)"   # 1492 B, ends at the epilogue ret
+    match_bytes: 128
+    match: >-
+      ?? ?? ?? a9 fd 7b ?? a9 fd 43 ?? 91 ff 83 ?? d1 ff 03 ?? f9
+      e9 ?? ?? 91 e9 ?? ?? f9 e8 ?? ?? f9 e8 03 00 aa e8 ?? ?? f9
+      e0 03 01 aa e2 ?? ?? f9 e3 ?? ?? f9 e4 ?? ?? f9 e5 ?? ?? f9
+      e6 ?? ?? f9 e7 ?? ?? f9 e8 ?? ?? f9 e1 03 00 aa e1 ?? ?? f9
+      e2 ?? ?? f9 e3 ?? ?? f9 e4 ?? ?? f9 e5 ?? ?? f9 e6 ?? ?? f9
+      a7 ?? ?? f8 e8 ?? ?? 91 e8 ?? ?? f9 ?? ?? ?? 9? e0 ?? ?? f9
+      e8 ?? ?? 91 ?? ?? ?? 9?
+    match_semantics: |
+      32 instructions starting at 0x2aaa98 (the entry):
+        1        stp x28,x27,[sp,#-0x20]!   callee-save pair push (pair and
+                 frame delta masked — LLVM picks per build)
+        2        stp x29,x30,[sp,#0x10]     frame record (fd 7b kept: x29+sp
+                 is the ABI-stable frame-record shape)
+        3        add x29,sp,#0x10
+        4        sub sp,sp,#0x920           giant frame (masked; the webpki
+                 CRL/arena locals live on stack in this build)
+        5        ldr xzr,[sp]               stack-probe idiom — NOT an Ok
+                 preinit (same trap as the 0.23.38 entry's instruction 4)
+        6-7      add x9,sp,#0x560 ; str x9,[sp,#0xd8]    local addr spill
+        8        str x8,[sp,#0xe0]          SRET SPILL — x8 is the sret under
+                 AAPCS64 indirect-return; kept Rt=x8 (e8) as an anchor
+        9        mov x8,x0                  self into x8 (literal)
+        10       str x8,[sp,#0xe8]          self spill
+        11       mov x0,x1                  end_entity becomes arg0 of try_from
+                 (literal — the ABI pivot of the prologue)
+        12-17    str x2..x7,[sp,#imm]       remaining ABI arg spills in
+                 register order (intermediates, server_name, ocsp, now, ext)
+        18       str x8,[sp,#0x7f8]         high-frame self spill
+        19       mov x1,x0                  (literal)
+        20-25    str x1..x6,[sp,#imm]       re-spill run — the two-phase
+                 lowering (copy args, keep them alive across the try_from
+                 call) is this build's signature shape
+        26       stur x7,[x29,#-0x100]
+        27-28    add x8,sp,#0x318 ; str x8,[sp,#0x120]   &ParsedCertificate
+                 out-param for try_from
+        29       bl <ParsedCertificate::try_from>        FIRST call (target
+                 masked — call-site encodings shift with any codegen change)
+        30-31    ldr x0,[sp,#0x120] ; add x8,sp,#0x220   branch args
+        32       bl <Try::branch>
+      DISCRIMINATING ANCHORS: the sret spill (Rt=x8) + the literal
+      mov x8,x0 / mov x0,x1 / mov x1,x0 pivot + the ordered x2..x7 spill run
+      followed by the x1..x6 re-spill run + the trailing bl pair. Register
+      columns (byte 0) are kept wherever they carry ABI meaning; immediates
+      are masked throughout.
+    patch_offset: 0
+    patch_bytes: "e9 1f 80 52 09 01 00 39 1f 05 00 f9 1f 09 00 f9 c0 03 5f d6"
+    patch_semantics: >-
+      mov w9,#0xFF ; strb w9,[x8] ; str xzr,[x8,#8] ; str xzr,[x8,#0x10] ;
+      ret (20 bytes). movz encoding: word = 0x52800000 | (0xFF << 5) | 9 =
+      0x52801fe9, little-endian bytes e9 1f 80 52. Assembler-verified with
+      Apple clang (arm64-apple-ios15.0 target) this time — objdump reads back
+      exactly these five instructions.
+    why_this_shape: >
+      x8 holds the sret pointer at entry (AAPCS64 indirect-result reg) — the
+      entry code itself spills it as its first data move, which is how the
+      window anchors on it. The target's dispatchers read ONLY the first byte
+      (ldrb + subs #0xff), so a 1-byte tag store is what the ABI requires;
+      the two `str xzr` after it zero the first payload words defensively and
+      — the practical reason — stretch the sequence to 20 bytes for
+      pipeline-wide uniformity with the Android entries (same idempotence
+      story: patch_offset 0 means the patched lib no longer matches the
+      window, and exactly-one-occurrence of the stub = already-applied).
+      Returning without touching sp/x29/x30 leaves the frame intact.
+      NOTE ON THE TAG CONSTANT: 0xFF is THIS binary's tag
+      (ok_tag_convention steps 1-2). For any other binary, re-derive from the
+      producer strb and the dispatcher cmps and re-encode movz:
+      word = 0x52800000 | (tag << 5) | Rd. Assemble with a real toolchain and
+      disassemble-verify — hand-encoding has produced silent garbage before
+      (0.23.37 yaml, why_this_shape).
+    validation:
+      uniqueness: >
+        Whole-slice scan of the derivation binary: exactly 1 site at 0x2aaa98
+        (the entry); 0 pre-existing occurrences of the 20-byte stub. The three
+        Android DB windows score 0 sites on this slice (measured) — no
+        cross-matching in either direction, and the arch gate would keep them
+        apart even if bytes did collide.
+      tag_derivation: >
+        ok_tag_convention steps 1-2 re-run on this slice (producer strb w8 of
+        #0xFF + two dispatcher subs #0xff). Stub encoding assembler-verified.
+
+prior_art: |
+  Same move as the Android entries (patterns/rustls-0.23.3[7-9]*_aarch64*.yaml):
+  force verify_server_cert to Ok. The iOS delta is entirely in the DERIVATION
+  chain (dyld_info fixups instead of .rela.dyn addends; Location structs in
+  __DATA_CONST with file==vmaddr; ADRP/ADD xrefs instead of GOT-walking) and
+  in re-signing after the byte surgery (ad-hoc codesign or the OS refuses to
+  even launch the modified bundle — see docs/lab-setup.md). reFlutter ships an
+  iOS engine repack; for the rustls trust move on a Flutter+FRB app we know of
+  no prior published pattern DB entry.
+
+runtime_findings: |
+  Live on the iOS simulator (2026-10-02, the derivation binary's own app,
+  recipe: docs/lab-setup.md §iOS-simulator):
+  - `rerust patch app.ipa --proxy http://<lan-ip>:9999` patched the arm64
+    slice at 0x2aaa98+slice-base and refused nothing; the x86_64 slice of the
+    same dylib was (correctly) reported in trust_skipped — no x86_64-ios
+    entry exists.
+  - mitmdump on the LAN proxy captured the full chain: client connect from
+    the app (the M1 shim's baked ALL_PROXY fired in the constructor — console
+    shows `[reRust] proxy set: ...`), TLS handshake with mitm's UNTRUSTED
+    certificate accepted (this entry's doing — webpki-roots is compiled in,
+    so no keychain trust could have explained it away), decrypted HTTP/2
+    GET www.example.com + 200.
+  - The app UI displayed the decrypted body verbatim (`200 OK
+    server=cloudflare body=<!doctype html>...`).
+  - NEGATIVE CONTROL (same proxy, `--no-trust`): the UI showed the rustls
+    connect failure instead — the 20-byte patch is load-bearing, not the
+    proxy alone.
+  - Signing: ad-hoc codesign had to cover every byte-surgered nested binary
+    (shim + patched rust dylib) BEFORE the bundle; the pipeline does this in
+    the right order now (and skips the main executable — bundle signing
+    regenerates its CodeDirectory).
+

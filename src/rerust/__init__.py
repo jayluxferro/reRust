@@ -5,4 +5,4 @@ env-proxy shim + trust patch, or drive the same at runtime via Frida.
 See SPEC.md.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"

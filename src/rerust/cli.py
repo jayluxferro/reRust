@@ -17,7 +17,7 @@ import sys
 import zipfile
 from pathlib import Path
 
-from . import assets, frida_script, pipeline, trust
+from . import assets, frida_script, macho, pipeline, trust
 from .apk_inspect import inspect_apk, read_native_libs
 
 # Exit codes for `inspect`: 0 = report produced; 1 = ran fine but no Rust
@@ -56,12 +56,31 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 def cmd_patch(args: argparse.Namespace) -> int:
     """Repack with the env-proxy shim + rustls trust patch (SPEC M1 + T1).
 
-    Runs rerust.pipeline in-process — works from a repo checkout AND an
-    installed wheel (shim sources and the pattern DB resolve via rerust.assets).
+    Dispatch by input: an .ipa (or a bare Mach-O) goes to the iOS pipeline
+    (rerust.repack_ipa — LC_LOAD_DYLIB injection, ad-hoc codesign), anything
+    else to the Android one. Runs in-process — works from a repo checkout AND
+    an installed wheel (shim sources and the pattern DB resolve via
+    rerust.assets).
     """
+    src = Path(args.apk)
+    if src.suffix == ".ipa" or _is_macho(src):
+        from . import repack_ipa
+
+        if not args.out:
+            args.out = str(src.with_suffix("")) + ".rerust.ipa"
+        return repack_ipa.run_patch_ipa(args)
     if not args.out:
-        args.out = str(Path(args.apk).with_suffix("")) + ".rerust.apk"
+        args.out = str(src.with_suffix("")) + ".rerust.apk"
     return pipeline.run_patch(args)
+
+
+def _is_macho(path: Path) -> bool:
+    """Bare Mach-O dispatch (thin or fat magic) — the .so/.dylib case."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) in macho.MACHO_MAGICS
+    except OSError:
+        return False
 
 
 def cmd_frida(args: argparse.Namespace) -> int:
@@ -136,6 +155,10 @@ def main(argv: list[str] | None = None) -> int:
     pi.set_defaults(fn=cmd_inspect)
     pp = sub.add_parser("patch", help="repackage with the env-proxy shim + rustls trust patch (M1 + T1)")
     pipeline.add_patch_args(pp)
+    # iOS path (rerust patch app.ipa): extra knobs the Android pipeline ignores.
+    pp.add_argument("--no-sign", action="store_true",
+                    help="iOS: skip the ad-hoc re-sign (output will not launch)")
+    pp.add_argument("--codesign", default="codesign", help="iOS: codesign binary to use")
     pp.set_defaults(fn=cmd_patch)
     pf = sub.add_parser("frida", help="emit a Frida runtime agent (env-proxy + trust patch + observer)")
     pf.add_argument("target", help="APK/zip or native lib to fingerprint")

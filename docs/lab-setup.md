@@ -8,6 +8,10 @@ rerust patch app.apk --proxy http://127.0.0.1:9999 --out app.rerust.apk
 # (e.g. embedded runtimes that dial sockets directly)
 ```
 
+`rerust patch` dispatches on the input: an `.ipa` (or a bare Mach-O for
+`inspect`) takes the iOS pipeline — same flag surface, iOS mechanics
+(see the iOS section at the bottom).
+
 ## Point the device at your proxy
 
 On an emulator, do NOT bake the host's `10.0.2.2` alias into the shim — on several
@@ -77,3 +81,95 @@ compiled-in roots — that half needs **[reFlutter](https://github.com/Impact-I/
 (engine patch) on top. The two tools compose: reFlutter the app first, then
 reRust-patch the same build (or vice versa) — each owns a different half of the
 network stack. `rerust inspect` tells you which libs carry which half.
+
+## iOS (.ipa)
+
+The same CLI drives the iOS pipeline; it dispatches on the `.ipa` extension.
+The trust move is byte-identical in spirit (one pattern entry per arch, in
+`patterns/rustls-*-arm64_ios.yaml`), the loader mechanics differ:
+
+```bash
+# 1. package the built app as an .ipa — note the Payload/ wrapper: ditto
+#    archives the CONTENTS of its source dir, so wrap the app in Payload/
+#    and keep that dir name with --keepParent
+mkdir -p stage/Payload && ditto build/ios/iphonesimulator/Runner.app stage/Payload/Runner.app
+ditto -c -k --keepParent stage/Payload app.ipa
+
+# 2. patch (builds the shim via xcrun; re-signs ad-hoc)
+rerust patch app.ipa --proxy http://<lan-ip>:9999 --out app.rerust.ipa
+
+# 3. run it against the proxy
+xcrun simctl boot "iPhone 17 Pro"
+xcrun simctl install booted app.rerust.ipa
+mitmdump --listen-host <lan-ip> -p 9999 &
+xcrun simctl launch --console-pty booted <bundle-id>
+```
+
+Simulator notes:
+
+- **The simulator shares the host network.** There is no `10.0.2.2` alias and
+  no need for reverse tunnels: bake the host's LAN IP (or `127.0.0.1`) into
+  the shim and point mitmdump at the same address.
+- **Simulator builds are debug-flavored only** (`flutter build ios
+  --simulator`; Apple does not ship a release sim SDK). Modern Xcode emits a
+  stub main executable that `LC_LOAD_DYLIB`s a `Runner.debug.dylib`, which in
+  turn loads frameworks through `@rpath/...`. Plain `simctl launch` resolves
+  those fine — no Xcode environment needed (verified: the frameworks load and
+  the injected shim's `@rpath/librerust.dylib` resolves through the same
+  mechanism).
+- **Code signing**: byte surgery invalidates embedded signatures, and even
+  the simulator refuses to launch code whose signature doesn't match its
+  content. The pipeline re-signs ad-hoc (`codesign -f -s -`), in the order
+  the format demands: shim dylib and every patched nested binary first, the
+  bundle itself last (bundle signing regenerates the main executable's
+  CodeDirectory — the reason a modified macOS/iOS app needs exactly one
+  re-sign command, not per-binary passes). `--no-sign` skips this for tests;
+  the output will not launch anywhere.
+- **What is in scope**: self-built or otherwise directly-signed apps
+  (development/ad-hoc/distribution-signed ipas that run on your machine).
+  **App Store ipas are FairPlay-encrypted** — the binary on disk is a cipher
+  blob until the loader decrypts it, so no static patch pipeline can reach
+  it; that requires a decrypted dump (out of scope). A physical device
+  additionally needs development signing + a provisioned device and will
+  likely need a device-arch pattern derived separately (simulator codegen is
+  debug-flavored and the byte windows will not match a device build).
+- **Shim injection needs header padding.** LC_LOAD_DYLIB is written into the
+  zero-padding after the load commands — real ld leaves little. The pipeline
+  tries a 48-byte `@rpath/librerust.dylib` command first and a 72-byte
+  `@executable_path/Frameworks/...` command second, and refuses loudly
+  (no silent header rewrite) if neither fits.
+
+### Toolchain quirks hit while building an FRB app for the simulator
+
+Lab-machine archaeology, kept here because every one of them cost real time:
+
+- **rustup home skew**: if `rustc` in `PATH` is a non-rustup (e.g. Homebrew)
+  toolchain, toolchain cargo spawns it and dies with `E0463: can't find crate
+  for core` for `-target aarch64-apple-ios-sim` (no ios-sim std there). The
+  working `PATH` puts `~/.cargo/bin` FIRST so the rustup proxy resolves the
+  rustup toolchain.
+- **backtrace vs libc bit-rot on ios-sim**: libc ≥ 0.2.174 dropped the
+  `_dyld_image_count` family that backtrace ≤ 0.3.76 still declares via
+  `libc::`, and pinning libc is impossible (tokio-adjacent crates floor it
+  higher). flutter_rust_bridge hardcodes allo-isolate's `backtrace` feature,
+  so you cannot sever it from the app either. Workaround: vendor a backtrace
+  fork that declares the four `dyld` functions directly (a `dyld` extern
+  module in `symbolize/gimli/libs_macos.rs`).
+- **Xcode 27 `lipo -verify_arch` accepts exactly ONE arch**: the two-arch
+  invocation misparses the extra arch as an input file and fails, which
+  breaks flutter_tools' thinFramework step for simulator builds (script
+  phases also get Xcode's toolchain dir prepended to PATH, so a PATH shim of
+  `lipo` does not reach them). Local flutter_tools patch: verify per-arch
+  with AND semantics. Remember flutter_tools caches its snapshot — deleting
+  `bin/cache/flutter_tools.snapshot` (+ `.stamp`) is required after editing
+  its Dart sources.
+
+### Recipe proven end-to-end
+
+Flutter + flutter_rust_bridge app, reqwest/rustls 0.23.45 (webpki-roots)
+core: patched ipa installs on a booted simulator, the shim's constructor
+bakes the proxy, and the app displays the **decrypted** response served by
+mitmdump (`200 OK server=cloudflare ...`), while the same build with
+`--no-trust` fails the handshake with a rustls connect error — the 20-byte
+trust patch is load-bearing. Pattern derivation walkthrough:
+`docs/research/ios-macho-walkthrough.md`.
